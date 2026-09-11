@@ -1,72 +1,80 @@
 # Search and Rescue: Engineering Task
 
-This is a take-home exercise on a live benchmark. You are working in a copy of the production
-repository for Bittensor subnet 124, against the same simulator, the same scoring and the same
-1,100-seed evaluation the network itself runs.
+This repository is a copy of the production codebase for Bittensor subnet 124. The simulator, the
+scoring and the 1,100-seed evaluation are the same ones the live network runs.
 
-Read [`NOTES.md`](NOTES.md) before installing anything. Every item in it has cost somebody a day.
+Read [`NOTES.md`](NOTES.md) before installing. It covers the platform requirements and several
+behaviours of this codebase that are not obvious from the source.
 
-## The problem
+## The challenge
 
-A drone lifts off with a rough pointer to a search area. A person is on the ground somewhere inside
-a 30 metre circle around that point, never at its centre. The drone has 60 seconds and a 3 m/s
-speed limit.
+A drone lifts off with a coarse pointer to a search area. A person is on the ground somewhere
+inside a 30 metre circle around that point, and never at its centre. The episode lasts 60 seconds
+with a 3 m/s speed limit.
 
-To succeed it must hold a hover 2 to 4 metres above the person, within 2 metres horizontally, under
-1 m/s, for two unbroken seconds. Coming within 0.8 metres ends the mission in failure. It sees
-depth continuously out to 30 metres, and colour only on request, 40 times per flight.
+The mission succeeds when the drone holds a hover 2 to 4 metres above the person, within 2 metres
+horizontally, below 1 m/s, for two continuous seconds. Approaching within 0.8 metres terminates the
+episode as a failure. Depth is available continuously to 30 metres. Colour is available on request,
+40 frames per episode.
 
 ```
-score = 0.45 x found them
-      + 0.45 x how fast
-      + 0.10 x how safely it flew
+score = 0.45 x mission success
+      + 0.45 x time
+      + 0.10 x clearance held
 
-anything short of a confirmed hover = 0.01
+any outcome short of a confirmed hover = 0.01
 ```
 
-The full specification is in [`docs/families/search_and_rescue.md`](../docs/families/search_and_rescue.md).
-It is thorough and worth reading properly before you start.
+A model's score is the mean across 1,100 procedurally generated seeds spanning six environment
+types. The complete specification is in
+[`docs/families/search_and_rescue.md`](../docs/families/search_and_rescue.md).
 
-## The starting point
+## Starting point
 
-`champion/` holds the model that currently holds the crown on this challenge. It scores **0.9151**
-across 1,100 seeds spanning six environment types. Its source and weights are published, as every
-champion's are, and you are free to fork it, modify it, replace it or ignore it.
+`champion/submission.zip` is the model currently holding the crown on this challenge, scoring
+**0.9151**. Every champion on this network is published with its source and weights, so it is
+yours to read, fork, modify, replace or disregard.
 
-## What we are asking
+## The exercise
 
-**Find where that model loses score. Work out why. Improve it. Show us how you measured.**
+Find where that model loses score, establish why, and improve it.
 
-Hand back three things:
+Three deliverables:
 
-1. **What you found.** Where the score goes, and why. Include the evidence you used to decide, not
-   only the conclusion.
-2. **What you changed.** Any improvement, with a before and after on the practice seed set, and an
-   honest read on whether the difference is real or noise.
-3. **What you would do next.** One page. Given a month and a GPU, what would you build, and what
-   would you measure to know it had worked.
+| | Deliverable | |
+|---|---|---|
+| 1 | **Analysis** | Where the score is lost and why, with the evidence behind the conclusion rather than the conclusion alone. |
+| 2 | **A change** | Any improvement you can demonstrate, with before and after figures on the practice seed set and an assessment of whether the difference is significant. |
+| 3 | **A plan** | One page. Given a month and a GPU, what you would build and what you would measure to establish that it worked. |
 
-Item 2 carries less weight than items 1 and 3. Nobody is expected to beat the champion in a few
-days, and a large jump in score is not what we are looking for. We want to see how you approach a
-system you did not write, on a problem where the answer is not known.
+The exercise weights 1 and 3 above 2. This benchmark has been open to a competitive network for
+months, so a large score improvement in a few days is not the expected outcome. What is being
+assessed is how you approach an unfamiliar system and an open problem.
 
-## Running it
+## Evaluation
 
-Install, then confirm the environment is healthy:
+Submissions are scored on a separate 1,100-seed set, generated the same way as the practice set and
+withheld. The two sets do not overlap. A change tuned to the practice seeds will not carry across,
+and the difference between the two figures is itself informative.
+
+Scoring runs on a single machine for all submissions, because per-step timing strikes make results
+from different hardware incomparable.
+
+## Working with the benchmark
+
+Confirm the environment first. Every line marked required must report OK:
 
 ```bash
 swarm doctor
 ```
 
-Every line marked required must read OK. If Docker is not among them, see `NOTES.md`.
-
-Benchmark the champion to get your baseline:
+Establish the baseline:
 
 ```bash
-./run_baseline.sh
+./TASK/run_baseline.sh
 ```
 
-Benchmark your own model against the same seeds:
+Evaluate your own model against the same seeds:
 
 ```bash
 swarm model package --source ./my_model --family-id cf_search_and_rescue
@@ -78,11 +86,12 @@ swarm benchmark --model Submission/submission.zip \
   --summary-json-out results.json
 ```
 
-`practice_seeds.json` holds 1,100 seeds in the same per-map proportions the live benchmark uses, so
-a full run is directly comparable to the published leaderboard figures. A full run is also several
-hours. See `NOTES.md` for how to cut it down while you are iterating.
+`practice_seeds.json` holds 1,100 seeds in the same per-map proportions as the live benchmark, so a
+complete run is directly comparable to published leaderboard figures. A complete run takes several
+hours; `NOTES.md` covers how to work against a subset while iterating.
 
-To see a failure rather than read about it, take a seed that scored badly and render the flight:
+Individual failures can be inspected rather than inferred. List the seeds that did not succeed,
+then render one:
 
 ```bash
 swarm visualize --summary-json results.json --failed
@@ -90,25 +99,16 @@ swarm video --model Submission/submission.zip --seed <seed> --type <type> \
   --family-id cf_search_and_rescue --backend local --mode depth --out ./videos
 ```
 
-## How your work is scored
+## Submitting
 
-Your submission is evaluated on a **separate 1,100-seed set that you have not seen**, drawn the same
-way as the practice set and held back. Tuning to the practice seeds will not transfer, and the gap
-between the two numbers is itself something we look at.
+Push to this repository: your code, your model artifact, and the write-up as a markdown file at the
+repository root.
 
-We run that evaluation ourselves on one machine, so hardware differences between candidates do not
-affect the result.
+## Reference
 
-## Handing it back
-
-Push everything to this repository: your code, your model artifact, and your write-up as a markdown
-file at the repository root. Commit history is welcome and is not judged.
-
-## Further reading
-
-| Document | Why |
+| Document | Covers |
 |---|---|
-| [`docs/families/search_and_rescue.md`](../docs/families/search_and_rescue.md) | The complete task specification |
+| [`NOTES.md`](NOTES.md) | Platform requirements, installation, run times, known issues |
+| [`docs/families/search_and_rescue.md`](../docs/families/search_and_rescue.md) | Full task specification: observations, actions, episode rules, scoring |
 | [`miner/docs/miner.md`](../miner/docs/miner.md) | Packaging, submission format, runtime limits |
 | [`docs/CLI_readme.md`](../docs/CLI_readme.md) | Every command and flag |
-| [`NOTES.md`](NOTES.md) | Environment constraints and known traps |

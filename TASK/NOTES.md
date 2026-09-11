@@ -1,58 +1,30 @@
 # Environment Notes
 
-Read this before installing. Each item below is a real constraint of this codebase, verified
-against it, and each one has cost somebody a working day.
+Platform requirements, installation, and behaviours of this codebase that are not apparent from
+the source.
 
-## Platform
+## Platform requirements
 
-The simulator depends on a custom Bullet fork, `swarm-bullet3`, which publishes exactly two wheels
-to PyPI and no source distribution:
+The simulator depends on `swarm-bullet3`, a Bullet fork that publishes two wheels to PyPI and no
+source distribution:
 
 ```
 swarm_bullet3-2.0.0.3-cp310-cp310-manylinux_2_34_x86_64.whl
 swarm_bullet3-2.0.0.3-cp311-cp311-manylinux_2_34_x86_64.whl
 ```
 
-That means **Linux x86-64, glibc 2.34 or newer, Python 3.10 or 3.11**. There is no macOS build, no
-Windows build, no ARM build, and no Python 3.12 build. Installation fails outright on anything
-else, and there is no workaround short of building the fork yourself.
+The requirement is therefore **Linux x86-64, glibc 2.34 or newer, Python 3.10 or 3.11**. There is
+no macOS, Windows, ARM or Python 3.12 build, and installation fails on any of them with no
+available workaround.
 
-If the machine you have does not meet that, ask us and we will give you one that does.
+A GPU is not required at any point.
 
-## Docker
+## Installation
 
-`swarm benchmark` runs your model inside a sandboxed container and there is no path around it. The
-setup scripts in this repository do not install Docker, but `swarm doctor` requires it, so install
-it separately:
+### PyTorch
 
-```bash
-curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker "$USER" && newgrp docker
-```
-
-Each container is then locked down from the host using `nsenter` and `iptables`. If those two are
-missing, or if you run as a user without the capability to use them, **every seed fails** with an
-infrastructure error that names Docker rather than permissions. Either run the benchmark with
-`sudo -E`, or grant the capabilities once:
-
-```bash
-sudo apt install -y iptables util-linux
-sudo setcap cap_sys_admin+ep "$(which nsenter)"
-sudo setcap cap_net_admin+ep "$(readlink -f "$(which iptables)")"
-```
-
-The first benchmark run builds a container image of roughly 2 GB, which takes several minutes.
-Before building it, the tooling prunes stopped containers, dangling images and unused volumes on
-your machine. If you have other Docker work in progress, be aware of that.
-
-`swarm model verify` and `swarm video --backend local` both run in-process and need no Docker, but
-neither produces a score.
-
-## Save the CUDA download
-
-The host requirements pull the CUDA build of PyTorch, roughly 4 GB of wheels that nothing here
-uses. No GPU is required anywhere in this task. Install the CPU build first and the rest of the
-install will treat it as satisfied:
+The host requirements resolve to the CUDA build of PyTorch, approximately 4 GB of wheels that
+nothing in this task uses. Installing the CPU build first satisfies the dependency:
 
 ```bash
 pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
@@ -60,25 +32,52 @@ pip install -r requirements.txt
 pip install -e . --no-deps
 ```
 
-## The reinforcement learning starter does not train
+### Docker
 
-`miner/src/RL/` contains a PPO example that packages a valid, contract-compliant submission. It
-cannot learn anything.
+`swarm benchmark` executes models inside a sandboxed container, and there is no alternative path to
+a score. Docker is required by `swarm doctor` but is not installed by the setup scripts in this
+repository:
 
-The reward it passes to the learner is the per-step change in the rollout score. That score is a
-terminal quantity: until an episode ends it is a constant, and the change in a constant is zero. A
-full episode therefore delivers a reward of exactly 0.0 on every one of its 3,000 steps, so there
-is no gradient signal of any kind.
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER" && newgrp docker
+```
 
-It also flattens the depth image straight into a 64-unit dense layer with no convolution, and never
-requests a colour frame.
+Each container is then isolated from the host using `nsenter` and `iptables`. If either is absent,
+or the invoking user lacks the capability to use them, every seed fails with an infrastructure
+error that reports Docker rather than permissions. Run the benchmark under `sudo -E`, or grant the
+capabilities once:
 
-You are welcome to build your own training loop. Do not assume this one is a working starting
-point, and do not spend days waiting on it.
+```bash
+sudo apt install -y iptables util-linux
+sudo setcap cap_sys_admin+ep "$(which nsenter)"
+sudo setcap cap_net_admin+ep "$(readlink -f "$(which iptables)")"
+```
 
-## Compute and run times
+The first benchmark run builds a container image of roughly 2 GB. Before building, the tooling
+prunes stopped containers, dangling images and unused volumes on the host.
 
-Measured on eight cores. A full 60-second episode costs, per seed on one worker:
+`swarm model verify` and `swarm video --backend local` run in process and require no Docker.
+Neither produces a score.
+
+## Known issue: the bundled reinforcement learning example
+
+`miner/src/RL/` contains a PPO example that produces a valid, contract-compliant submission. It
+cannot learn.
+
+The reward passed to the learner is the per-step change in the rollout score. That score is a
+terminal quantity: it remains constant until the episode ends, and the change in a constant is
+zero. Every step of every episode therefore returns exactly 0.0, and no gradient signal reaches
+the policy.
+
+The example also flattens the depth image directly into a 64-unit dense layer with no convolution,
+and never requests a colour frame.
+
+It is included because it ships with the upstream repository, not as a recommended starting point.
+
+## Run times
+
+Measured on eight cores, per seed on one worker, for an episode running the full 60-second horizon:
 
 | Environment | CPU time |
 |---|---|
@@ -89,11 +88,11 @@ Measured on eight cores. A full 60-second episode costs, per seed on one worker:
 | forest | 225 s |
 | warehouse | 292 s |
 
-Rendering the depth camera is 45 to 80 percent of every simulation step, and it is CPU only.
-Episodes that succeed end early, so real runs are faster than the table implies.
+Depth rendering accounts for 45 to 80 percent of each simulation step and runs on CPU. Successful
+episodes terminate early, so observed runs are faster than the table suggests.
 
-A full 1,100-seed run is several hours. While iterating, make a smaller file by trimming the lists
-in `practice_seeds.json`, keeping all six groups present and non-empty:
+A complete 1,100-seed run takes several hours. To iterate against a subset, trim the seed lists,
+keeping all six groups present and non-empty:
 
 ```python
 import json
@@ -102,35 +101,35 @@ d["type_seeds"] = {k: v[:10] for k, v in d["type_seeds"].items()}
 json.dump(d, open("quick_seeds.json", "w"), indent=2, sort_keys=True)
 ```
 
-Use the full set for any number you report.
+Figures reported in the write-up should come from the full set.
 
-## Measuring honestly
+## Interpreting results
 
-Per-seed scores on this benchmark are close to bimodal: an episode either confirms and scores near
-0.95, or fails and scores 0.01. The per-seed standard deviation is therefore large, around 0.25, so
-a twenty-seed run tells you very little.
+Per-seed scores are close to bimodal: an episode either confirms and scores near 0.95, or fails and
+scores 0.01. Per-seed standard deviation is consequently around 0.25, so small samples carry little
+information.
 
-Compare runs on **identical seed lists**, and treat a change smaller than a couple of points on a
-small sample as unproven. Saying that a result is inconclusive is a valid finding here.
+Compare runs on identical seed lists. On a small sample, a difference of a few points is not
+evidence of an improvement, and reporting a result as inconclusive is a legitimate outcome.
 
-## Useful flags
+## Command reference
 
-| Flag | Why |
+| Flag | Effect |
 |---|---|
-| `--relax-timeouts` | Raises the per-step compute budget. On a laptop, without it, a slow model accumulates strikes and fails seeds for reasons unrelated to its behaviour. |
-| `--seed-file` | Replays an exact seed set. Always pass it, so your runs are comparable. |
-| `--summary-json-out` | Per-seed results, including the failure reason for every seed. This is the most useful artifact the benchmark produces. |
+| `--family-id cf_search_and_rescue` | Required. Several commands default to a different family. |
+| `--seed-file` | Replays an exact seed set. Pass it on every run so results remain comparable. |
+| `--summary-json-out` | Per-seed results including the failure reason for each seed. |
+| `--relax-timeouts` | Raises the per-step compute budget. Without it on modest hardware, a slow model accumulates strikes and fails seeds for reasons unrelated to its behaviour. |
 | `--workers N` | One worker per two cores. |
-| `--family-id` | Always pass `cf_search_and_rescue`. Several commands default to a different family. |
 
-## Runtime limits your model must respect
+## Model constraints
 
-| Limit | Value |
+| Constraint | Value |
 |---|---|
 | Uncompressed archive | 50 MiB |
 | Container resources | 6 GB memory, 2 CPUs |
 | Per-step budget | 0.6 baseline-equivalent seconds |
 | First step | 2.0 seconds |
-| Package whitelist | see the Docker whitelist in `miner/docs/miner.md` |
+| Permitted packages | Docker whitelist in [`miner/docs/miner.md`](../miner/docs/miner.md) |
 
-Timing is hardware normalised, so a slower machine is not penalised.
+Timing is normalised against a hardware baseline, so slower machines are not penalised.
