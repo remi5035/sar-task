@@ -1,0 +1,180 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+import socket
+import subprocess
+from typing import Optional
+
+import bittensor as bt
+
+# Each worker owns a disjoint port band so parallel workers never race for a host port.
+_PORT_BASE = 49200
+_PORT_STRIDE = 20
+
+
+def _find_free_port(self, worker_id: int = 0) -> int:
+    base = _PORT_BASE + int(worker_id) * _PORT_STRIDE
+    for candidate in range(base, base + _PORT_STRIDE):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", candidate))
+                return candidate
+            except OSError:
+                continue
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+def _check_rpc_ready(self, host_port: int, timeout: float = 0.2) -> bool:
+    """Return True if the RPC server is accepting TCP connections on host_port."""
+    try:
+        with socket.create_connection(("127.0.0.1", int(host_port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+def _get_docker_host_ip(self) -> str:
+    """Get the Docker bridge gateway IP (host IP as seen from containers)"""
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "network",
+                "inspect",
+                "bridge",
+                "-f",
+                "{{range .IPAM.Config}}{{.Gateway}}{{end}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "172.17.0.1"
+
+def _get_container_pid(self, container_name: str) -> Optional[int]:
+    """Get the PID of a running container"""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Pid}}", container_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            pid = int(result.stdout.strip())
+            if pid > 0:
+                return pid
+    except Exception:
+        pass
+    return None
+
+def _apply_network_lockdown(self, container_pid: int, validator_ip: str) -> bool:
+    """Apply iptables rules in container's network namespace from HOST using nsenter"""
+    try:
+        rules = [
+            [
+                "nsenter",
+                "-t",
+                str(container_pid),
+                "-n",
+                "iptables",
+                "-A",
+                "OUTPUT",
+                "-d",
+                validator_ip,
+                "-j",
+                "ACCEPT",
+            ],
+            [
+                "nsenter",
+                "-t",
+                str(container_pid),
+                "-n",
+                "iptables",
+                "-A",
+                "OUTPUT",
+                "-d",
+                "127.0.0.1",
+                "-j",
+                "ACCEPT",
+            ],
+            [
+                "nsenter",
+                "-t",
+                str(container_pid),
+                "-n",
+                "iptables",
+                "-A",
+                "OUTPUT",
+                "-m",
+                "state",
+                "--state",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ],
+            [
+                "nsenter",
+                "-t",
+                str(container_pid),
+                "-n",
+                "iptables",
+                "-A",
+                "OUTPUT",
+                "-j",
+                "DROP",
+            ],
+        ]
+        for rule in rules:
+            result = subprocess.run(
+                rule, capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                bt.logging.warning(
+                    f"Failed to apply iptables rule: {' '.join(rule)}"
+                )
+                return False
+
+        ipv6_rules = [
+            ["nsenter", "-t", str(container_pid), "-n", "ip6tables",
+             "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+            ["nsenter", "-t", str(container_pid), "-n", "ip6tables",
+             "-A", "OUTPUT", "-j", "DROP"],
+        ]
+        for rule in ipv6_rules:
+            result = subprocess.run(rule, capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                stderr = (result.stderr or "").lower()
+                if "address family not supported" in stderr:
+                    # IPv6 is disabled on this host: no IPv6 egress exists, so
+                    # there is nothing to lock down.
+                    bt.logging.info(
+                        "IPv6 unavailable on host; skipping ip6tables lockdown"
+                    )
+                    break
+                bt.logging.warning(
+                    f"Failed to apply ip6tables rule: {' '.join(rule)}"
+                )
+                return False
+        return True
+    except Exception as e:
+        bt.logging.warning(f"Network lockdown failed: {e}")
+        return False

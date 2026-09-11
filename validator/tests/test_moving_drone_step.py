@@ -1,0 +1,93 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+from __future__ import annotations
+
+import gymnasium.spaces as spaces
+import numpy as np
+
+from swarm.core import moving_drone as moving_drone_mod
+
+
+def test_step_runs_collision_bookkeeping_after_physics(monkeypatch) -> None:
+    env = moving_drone_mod.MovingDroneAviary.__new__(moving_drone_mod.MovingDroneAviary)
+    env.RECORD = False
+    env.GUI = False
+    env.USER_DEBUG = False
+    env.USE_GUI_RPM = False
+    env.VISION_ATTR = False
+    env.step_counter = 0
+    env.PYB_STEPS_PER_CTRL = 1
+    env.PHYSICS = moving_drone_mod.Physics.PYB
+    env.NUM_DRONES = 1
+    env.CLIENT = 99
+    env.CTRL_FREQ = 50
+    env._time_alive = 0.0
+    env._step_processed = False
+    env._collision = False
+    env._success = False
+    env.action_space = spaces.Box(
+        low=-1.0,
+        high=1.0,
+        shape=(1, 4),
+        dtype=np.float32,
+    )
+    env.last_clipped_action = np.zeros((1, 4), dtype=np.float32)
+    env.family_runtime = type(
+        "FamilyRuntime",
+        (),
+        {
+            "advance_world": lambda self, env: None,
+            "apply_world_physics": lambda self, env: None,
+        },
+    )()
+
+    order: list[str] = []
+    flags = {"stepped": False}
+
+    monkeypatch.setattr(
+        moving_drone_mod.p,
+        "stepSimulation",
+        lambda **kwargs: (order.append("step_sim"), flags.__setitem__("stepped", True)),
+    )
+
+    env._preprocessAction = lambda action: action
+    env._physics = lambda rpm, i: order.append("physics_apply")
+    env._updateAndStoreKinematicInformation = lambda: order.append("store_kin")
+
+    def _check_collision():
+        assert flags["stepped"] is True
+        order.append("collision_check")
+        return False, False
+
+    env._check_collision = _check_collision
+    env._update_moving_platform = lambda: order.append("moving_platform")
+    env._family_post_step_update = lambda: order.append("family_step")
+    env._update_min_clearance = lambda: order.append("clearance")
+    env._apply_distance_cull = lambda: order.append("cull")
+    env._computeObs = lambda: {}
+    env._computeReward = lambda: 0.0
+    env._computeTerminated = lambda: False
+    env._computeTruncated = lambda: False
+    env._computeInfo = lambda: {}
+
+    moving_drone_mod.MovingDroneAviary.step(env, np.zeros((1, 4), dtype=np.float32))
+
+    assert order.index("moving_platform") < order.index("step_sim")
+    assert order.index("step_sim") < order.index("collision_check")
+    assert order.index("collision_check") < order.index("family_step")
+    assert abs(env._time_alive - (1.0 / env.CTRL_FREQ)) < 1e-9

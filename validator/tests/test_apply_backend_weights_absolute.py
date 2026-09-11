@@ -1,0 +1,95 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+"""Validator-side weight application. Each weight is an absolute fraction of
+total emissions; miners keep exactly their raw share and the unassigned
+remainder always goes to the burn UID, so the vector conserves to 1.0 and
+set_weights' normalization is a no-op."""
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+from bittensor.utils.weight_utils import process_weights
+
+from swarm.constants import UID_ZERO
+from swarm.validator.utils_parts.weights import (
+    _apply_backend_weights_to_scores_unlocked as apply_weights,
+)
+
+
+def _self(n=16):
+    return SimpleNamespace(metagraph=SimpleNamespace(n=n), scores=np.zeros(n, dtype=np.float32))
+
+
+def _sum(self):
+    return float(self.scores.sum())
+
+
+def test_miners_keep_raw_share_and_remainder_burns():
+    s = _self()
+    apply_weights(s, {"5": 0.10, "7": 0.10})
+    assert s.scores[5] == pytest.approx(0.10)
+    assert s.scores[7] == pytest.approx(0.10)
+    assert s.scores[UID_ZERO] == pytest.approx(0.80)
+    assert _sum(s) == pytest.approx(1.0)
+
+
+def test_empty_map_burns_everything():
+    s = _self()
+    apply_weights(s, {})
+    # Valid payload, nobody payable: the whole emission burns.
+    assert s.scores[UID_ZERO] == pytest.approx(1.0)
+    assert _sum(s) == pytest.approx(1.0)
+
+
+def test_uid0_entry_is_ignored_but_still_receives_remainder():
+    s = _self()
+    apply_weights(s, {"0": 0.5, "5": 0.10})
+    assert s.scores[5] == pytest.approx(0.10)
+    assert s.scores[UID_ZERO] == pytest.approx(0.90)
+
+
+def test_out_of_range_and_nonfinite_skipped():
+    s = _self(n=10)
+    apply_weights(s, {"999": 0.4, "-3": 0.2, "5": 0.10, "6": float("nan")})
+    assert s.scores[5] == pytest.approx(0.10)
+    assert s.scores[UID_ZERO] == pytest.approx(0.90)
+    assert _sum(s) == pytest.approx(1.0)
+
+
+def test_overallocation_is_clamped_to_full_pool():
+    s = _self()
+    apply_weights(s, {"5": 0.7, "7": 0.7})
+    assert s.scores[5] == pytest.approx(0.5)
+    assert s.scores[7] == pytest.approx(0.5)
+    assert s.scores[UID_ZERO] == pytest.approx(0.0)
+    assert _sum(s) == pytest.approx(1.0)
+
+
+def test_sparse_one_champion_survives_chain_processing_no_uid0_burn():
+    # Single-champion vector through Bittensor's processor (min=1, max=1.0): champion 1.0, UID0 0.
+    n = 256
+    uids = np.arange(n)
+    weights = np.zeros(n, dtype=np.float32)
+    weights[50] = 1.0
+    out_uids, out_weights = process_weights(
+        uids=uids, weights=weights, num_neurons=n,
+        min_allowed_weights=1, max_weight_limit=1.0,
+    )
+    out = {int(u): float(w) for u, w in zip(out_uids, out_weights)}
+    assert out.get(50, 0.0) == pytest.approx(1.0)
+    assert out.get(UID_ZERO, 0.0) == pytest.approx(0.0)

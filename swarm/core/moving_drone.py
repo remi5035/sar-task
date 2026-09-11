@@ -1,0 +1,1874 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# swarm/envs/moving_drone.py
+from __future__ import annotations
+
+import functools
+import math
+import os
+
+import numpy as np
+import pybullet as p
+from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
+from gym_pybullet_drones.utils.enums import (
+    ActionType,
+    DroneModel,
+    ImageType,
+    ObservationType,
+    Physics,
+)
+from gymnasium import spaces
+from PIL import Image
+
+from swarm.challenge_families import evaluate_rollout, runtime_family_for_task
+from swarm.constants import (
+    ALTITUDE_RAY_INSET,
+    CAMERA_EYE_FWD_M,
+    CAMERA_EYE_UP_M,
+    CAMERA_FOV_BASE,
+    CAMERA_FOV_VARIANCE,
+    CULL_INTERVAL_STEPS,
+    CULL_MIN_AABB_SPAN,
+    CULL_MIN_FACES,
+    CULL_MIN_TOTAL_FACES,
+    CULL_PHYSICS_RADIUS,
+    CULL_VISUAL_RADIUS,
+    DEPTH_FAR,
+    DEPTH_MAX_M,
+    DEPTH_MIN_M,
+    DEPTH_NEAR,
+    DRONE_HULL_RADIUS,
+    INTERCEPTOR_DEPTH_FAR_M,
+    INTERCEPTOR_DEPTH_MAX_M,
+    INTERCEPTOR_DEPTH_RES,
+    INTERCEPTOR_HULL_RADIUS,
+    LANDING_ALTITUDE_BUFFER,
+    LANDING_COLUMN_PADDING,
+    LANDING_FLOOR_MAX_HEIGHT,
+    LANDING_MAX_TILT_RAD,
+    LANDING_MAX_VXY_REL,
+    LANDING_MAX_VZ,
+    LANDING_PLATFORM_RADIUS,
+    LANDING_STABLE_SEC,
+    LIGHT_RANDOMIZATION_ENABLED,
+    MAX_RAY_DISTANCE,
+    OFFICE_APPEARANCE_SEED_OFFSET,
+    OFFICE_CAMERA_EYE_FWD_M,
+    OFFICE_CAMERA_RES,
+    OFFICE_MOTOR_TAU_SEC,
+    OFFICE_RC_DEAD_ZONE,
+    OFFICE_RC_SLEW_PER_SEC,
+    OFFICE_RC_YAW_LEAD_RAD,
+    OFFICE_RGB_NOISE_STD,
+    OFFICE_RGB_PERIOD_STEPS,
+    PLATFORM_AVOIDANCE_ENABLED,
+    PLATFORM_DELAY_MAX,
+    PLATFORM_DELAY_MIN,
+    PLATFORM_LINEAR_DIRECTIONS,
+    PLATFORM_MIN_STEP_M,
+    PLATFORM_MOVEMENT_PATTERNS,
+    PLATFORM_RADIUS_MAX,
+    PLATFORM_RADIUS_MIN,
+    PLATFORM_SPEED_MAX,
+    PLATFORM_SPEED_MIN,
+    PLATFORM_STEER_ANGLES,
+    PLATFORM_TRANSITION_MAX,
+    PLATFORM_TRANSITION_MIN,
+    SAFETY_DISTANCE_SAFE,
+    SAFETY_DISTANCE_SAFE_BY_TYPE,
+    SAR_DEPTH_MAX_M,
+    SAR_DEPTH_RES,
+    SAR_RGB_REQUEST_CAP,
+    SAR_RGB_RES,
+    SOLVER_ITERATIONS,
+    SOLVER_MIN_ISLAND_SIZE,
+)
+from swarm.core.daylight import apply_seeded_sun, sun_render_kwargs
+from swarm.core.observation import assemble, assemble_batch, observation_space, observation_vector_dim
+from swarm.core.wind import SeededWind
+
+# Families that get 256 px depth, 30 m range, and the on-demand RGB action value.
+_SAR_RGB_FAMILIES = ("cf_search_and_rescue", "cf_swarm_sar")
+
+# Families driven by body-frame RC sticks [lr, fb, ud, yaw] instead of the
+# world-frame velocity contract (indoor Tello: no GPS, no world frame).
+_OFFICE_RC_FAMILIES = ("cf_interceptor_office",)
+
+
+def rc_sticks_to_world_velocity(rc, yaw, speed):
+    """Map RC sticks [lr, fb, ud] to a world-frame velocity for the given yaw.
+
+    Body frame is Tello-style: fb along the camera heading, lr positive to the
+    drone's right, ud straight up. Per-axis scaling mirrors real RC sticks
+    (diagonal input is faster than a single axis, like the physical drone).
+    """
+    c, s = math.cos(yaw), math.sin(yaw)
+    lr, fb, ud = float(rc[0]), float(rc[1]), float(rc[2])
+    return np.array(
+        [speed * (fb * c + lr * s), speed * (fb * s - lr * c), speed * ud],
+        dtype=np.float64,
+    )
+
+
+def world_to_body(w, yaw):
+    """World vector to the same stick-aligned body axes (forward, right, up)."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    return (c * w[0] + s * w[1], s * w[0] - c * w[1], w[2])
+
+
+@functools.lru_cache(maxsize=4096)
+def _count_obj_faces_cached(path: str, mtime_ns: int, size: int) -> int:
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return 0
+    return data.count(b"\nf ") + (1 if data.startswith(b"f ") else 0)
+
+
+def _inside_safety_patch(contact_point, safety_patch) -> bool:
+    cx, cy = safety_patch.xy
+    dx = float(contact_point[0]) - float(cx)
+    dy = float(contact_point[1]) - float(cy)
+    horiz = math.hypot(dx, dy)
+    if horiz > safety_patch.radius:
+        return False
+    cz = float(contact_point[2])
+    z_low = float(safety_patch.surface_z) - float(safety_patch.z_below)
+    z_high = float(safety_patch.surface_z) + float(safety_patch.z_above)
+    return z_low <= cz <= z_high
+
+
+class MovingDroneAviary(BaseRLAviary):
+    """
+    Single‑drone environment whose *start*, *goal* and *horizon* are supplied
+    via an external `MapTask`.
+
+    The per-step reward is the incremental change in the family-owned rollout
+    score so training loops can consume it without additional shaping.
+    """
+    MAX_TILT_RAD: float = 1.047         # safety cut‑off for roll / pitch (rad)
+    _fov: float = 90.0
+
+    # --------------------------------------------------------------------- #
+    # 1. constructor
+    # --------------------------------------------------------------------- #
+    def __init__(
+        self,
+        task,
+        drone_model : DroneModel   = DroneModel.CF2X,
+        physics     : Physics      = Physics.PYB,
+        pyb_freq    : int          = 240,
+        ctrl_freq   : int          = 30,
+        gui         : bool         = False,
+        record      : bool         = False,
+        obs         : ObservationType = ObservationType.RGB,
+        act         : ActionType      = ActionType.RPM,
+        sar_mode    : bool          = False,
+        num_drones  : int           = 1,
+    ):
+        """
+        Parameters
+        ----------
+        task : MapTask
+            Must expose `.start`, `.goal`, `.horizon`, `.sim_dt`.
+        sar_mode : bool
+            Backward-compatible family runtime hint. The active challenge
+            family may normalize or ignore it.
+        """
+        self.task       = task
+        n_drones = max(1, int(getattr(task, "num_drones", 0) or num_drones))
+        self._original_start = tuple(task.start)
+        self._original_goal = tuple(task.goal)
+        if n_drones > 1:
+            starts = np.asarray(task.starts, dtype=float)
+            goals = np.asarray(task.goals, dtype=float)
+            if starts.shape != (n_drones, 3) or goals.shape != (n_drones, 3):
+                raise ValueError(
+                    f"num_drones={n_drones} requires task.starts/goals of shape "
+                    f"({n_drones}, 3); got {starts.shape} / {goals.shape}"
+                )
+            self.GOAL_POSES = goals
+            self.GOAL_POS   = self.GOAL_POSES[0]
+        else:
+            self.GOAL_POS   = np.asarray(task.goal, dtype=float)
+        self.EP_LEN_SEC = float(task.horizon)
+        self.family_runtime = runtime_family_for_task(task)
+        self._sky_colors = self.family_runtime.sky_colors(task)
+        self.sar_mode = bool(sar_mode)
+
+        self._time_alive = 0.0
+        self._success = False
+        self._collision = False
+        self._t_to_goal = None
+        self._prev_score = 0.0
+        self._step_processed = False
+        self._min_clearance_episode = SAFETY_DISTANCE_SAFE
+        self._takeoff_origins = None
+        self._takeoff_cleared = None
+
+        from swarm.protocol import FailureReason
+        self._failure_reason = FailureReason.NONE.value
+
+        n = n_drones
+        self._frozen = np.zeros(n, dtype=bool)
+        self._d_success = np.zeros(n, dtype=bool)
+        self._d_collision = np.zeros(n, dtype=bool)
+        self._d_t_to_goal = [None] * n
+        self._d_min_clearance = np.full(n, SAFETY_DISTANCE_SAFE, dtype=float)
+        self._d_failure_reason = [FailureReason.NONE.value] * n
+        self._d_landing_stable_time = np.zeros(n, dtype=float)
+        self._d_touch_platform = [None] * n
+
+        seed = getattr(task, 'map_seed', 0)
+
+        self._moving = getattr(task, 'moving_platform', False)
+        self._landing_stable_time = 0.0
+        self._platform_velocity = np.zeros(3, dtype=np.float32)
+        self._platform_orbit_center = self.GOAL_POS.copy()
+        self._current_platform_pos = self.GOAL_POS.copy()
+        self._prev_platform_pos = None
+        self._movement_pattern = self._get_movement_pattern_from_seed(seed)
+        self._platform_offsets = []
+        self._init_platform_randomization(seed)
+        wind_max = float(getattr(task, 'wind_max_mps', 0.0) or 0.0)
+        self._wind = None if wind_max <= 0.0 else SeededWind(
+            seed, max_mps=wind_max,
+            turbulence=float(getattr(task, 'wind_turbulence', 0.0) or 0.0),
+            gusts=int(getattr(task, 'wind_gusts', 0) or 0),
+            dt=float(task.sim_dt), horizon=float(task.horizon),
+        )
+        self._end_platform_uids = []
+        self._start_platform_uids = []
+        self._platform_hit = False
+
+        self._search_area_center = self.GOAL_POS.copy()
+        self.family_runtime.initialise_env_state(
+            self,
+            requested_mode=bool(sar_mode),
+        )
+
+        fov_rng = np.random.RandomState(seed)
+        fov_rng.rand()
+        self._fov = CAMERA_FOV_BASE + fov_rng.uniform(-CAMERA_FOV_VARIANCE, CAMERA_FOV_VARIANCE)
+
+        if LIGHT_RANDOMIZATION_ENABLED:
+            light_rng = np.random.RandomState(seed)
+            light_rng.rand()
+            light_rng.rand()
+            light_rng.rand()
+            angle = light_rng.uniform(0, 2 * np.pi)
+            self._light_direction = [
+                -np.cos(angle),
+                0.1 * np.sin(angle * 3),
+                np.sin(angle)
+            ]
+        else:
+            self._light_direction = [0, 0, 1]
+        # Neutral light tint; the office family overwrites it per episode.
+        self._light_color = [1.0, 1.0, 1.0]
+        self._sun = None
+        if getattr(self.family_runtime, "seeded_sun", False):
+            apply_seeded_sun(self, seed)
+
+        # Let BaseRLAviary set up the PyBullet world
+        super().__init__(
+            drone_model  = drone_model,
+            num_drones   = n_drones,
+            initial_xyzs = (
+                np.asarray([task.start])
+                if n_drones == 1
+                else np.asarray(task.starts)
+            ),
+            initial_rpys = None,
+            physics      = physics,
+            pyb_freq     = pyb_freq,
+            ctrl_freq    = ctrl_freq,
+            gui          = gui,
+            record       = record,
+            obs          = obs,
+            act          = act,
+        )
+
+        if self.OBS_TYPE != ObservationType.RGB:
+            raise ValueError("MovingDroneAviary only supports ObservationType.RGB observations.")
+
+        self._depth_far_m = DEPTH_FAR
+        self._depth_max_m = DEPTH_MAX_M
+        self._alt_ray_origin_offset = DRONE_HULL_RADIUS - ALTITUDE_RAY_INSET
+        family_id = getattr(self.family_runtime, "family_id", "")
+        self._sar_rgb_enabled = family_id in _SAR_RGB_FAMILIES
+        self._office_rc_enabled = family_id in _OFFICE_RC_FAMILIES
+        if family_id == "cf_interceptor":
+            from swarm.challenge_families.interceptor import make_interceptor_control
+            self.ctrl = [make_interceptor_control(self) for _ in range(self.NUM_DRONES)]
+            self._depth_far_m = float(INTERCEPTOR_DEPTH_FAR_M)
+            self._depth_max_m = float(INTERCEPTOR_DEPTH_MAX_M)
+            self._alt_ray_origin_offset = float(INTERCEPTOR_HULL_RADIUS - ALTITUDE_RAY_INSET)
+            enhanced_width = enhanced_height = int(INTERCEPTOR_DEPTH_RES)
+        elif self._office_rc_enabled:
+            from swarm.challenge_families.office_interceptor import make_office_control
+            self.ctrl = [make_office_control(self) for _ in range(self.NUM_DRONES)]
+            enhanced_width = enhanced_height = int(OFFICE_CAMERA_RES)
+        elif self._sar_rgb_enabled:
+            self._depth_far_m = float(SAR_DEPTH_MAX_M)
+            self._depth_max_m = float(SAR_DEPTH_MAX_M)
+            enhanced_width = enhanced_height = int(SAR_DEPTH_RES)
+        else:
+            enhanced_width, enhanced_height = 128, 128
+        self.IMG_RES = np.array([enhanced_width, enhanced_height])
+        self.dep = np.ones((self.NUM_DRONES, enhanced_height, enhanced_width), dtype=np.float32)
+        self._use_batch_depth = (
+            os.environ.get("SWARM_BATCH_DEPTH", "1") != "0"
+            and hasattr(p, "getDepthImagesBatch")
+        )
+        backend = os.environ.get("SWARM_RENDER_BACKEND") or self.family_runtime.render_backend
+        # The office family observes colour, which only TinyRenderer shades, so it stays there.
+        self._raycast_enabled = backend == "raycast" and not self._office_rc_enabled
+        self._render_flags = 0
+        if self._raycast_enabled:
+            if not hasattr(p, "ER_SWARM_RAYCAST"):
+                raise RuntimeError("render_backend 'raycast' needs a swarm-bullet3 wheel with ER_SWARM_RAYCAST")
+            self._render_flags = p.ER_SWARM_RAYCAST
+
+        # on-demand RGB state (SAR only): per-drone request budget + the frame served this step
+        if self._sar_rgb_enabled:
+            self._rgb_request_count = np.zeros(self.NUM_DRONES, dtype=np.int32)
+            self._rgb_buffer = np.zeros(
+                (self.NUM_DRONES, SAR_RGB_RES, SAR_RGB_RES, 3), dtype=np.float32
+            )
+            self._rgb_dirty = False
+
+        # RC state (office only).
+        if self._office_rc_enabled:
+            self._rc_command = np.zeros((self.NUM_DRONES, 4), dtype=np.float64)
+            self._rc_target_yaw = np.zeros(self.NUM_DRONES, dtype=np.float64)
+            self._rc_max_step = OFFICE_RC_SLEW_PER_SEC * self.CTRL_TIMESTEP
+            self._rc_dead_zone = OFFICE_RC_DEAD_ZONE
+            # First-order motor lag: rotors chase commanded RPM with tau ~ ESC+prop.
+            self._office_rpm = np.full((self.NUM_DRONES, 4), self.HOVER_RPM)
+            self._office_motor_alpha = 1.0 - float(
+                np.exp(-self.PYB_TIMESTEP / OFFICE_MOTOR_TAU_SEC)
+            )
+
+        self._clue_dim = int(self.family_runtime.state_clue_dim(task))
+        self._obs_layout = self.family_runtime.observation_assembly(task)
+        self.observation_space = observation_space(self._obs_layout, self)
+        self._state_dim = observation_vector_dim(self._obs_layout, self) or 0
+
+        self._cull_targets = []
+        self._cull_vis_hidden = set()
+        self._cull_phys_disabled = set()
+        self._cull_step_counter = 0
+        self._cull_enabled = False
+
+        self._cached_proj_matrix = None
+
+    # --------------------------------------------------------------------- #
+    # 2. low‑level helpers
+    # --------------------------------------------------------------------- #
+    @property
+    def _sim_dt(self) -> float:
+        """Physics step in seconds (1 / CTRL_FREQ)."""
+        return 1.0 / self.CTRL_FREQ
+
+    def _parseURDFParameters(self):
+        """For cf_interceptor and the office family, point self.URDF at the family's drone
+        before BaseAviary parses and loads it (both _parseURDFParameters and _housekeeping
+        read self.URDF, resolving it through swarm.utils.gym_assets' staged-path shim)."""
+        family_id = getattr(self.family_runtime, "family_id", "")
+        if family_id == "cf_interceptor":
+            from swarm.challenge_families.interceptor import ensure_interceptor_urdf_staged
+            self.URDF = ensure_interceptor_urdf_staged()
+        elif family_id in _OFFICE_RC_FAMILIES:
+            from swarm.challenge_families.office_interceptor import ensure_tello_assets_staged
+            self.URDF = ensure_tello_assets_staged()
+        return super()._parseURDFParameters()
+
+    def _actionSpace(self):
+        """SAR adds a 6th action value per drone: the RGB-on-demand request (0..1, fires above
+        0.5). The office family replaces the whole space with the 4 body-frame RC sticks
+        [lr, fb, ud, yaw]. Runs inside BaseRLAviary.__init__, so it gates on family_runtime
+        (set before super) and rebuilds the action buffer at the family's width."""
+        space = super()._actionSpace()
+        fam = getattr(getattr(self, "family_runtime", None), "family_id", "")
+
+        def _reseed_buffer(width):
+            # _reset_action_buffer reads action_space, which is not assigned yet
+            self.action_buffer.clear()
+            for _ in range(self.ACTION_BUFFER_SIZE):
+                self.action_buffer.append(np.zeros((self.NUM_DRONES, width)))
+
+        if fam in _OFFICE_RC_FAMILIES and self.ACT_TYPE == ActionType.VEL:
+            _reseed_buffer(4)
+            return spaces.Box(
+                low=-np.ones((self.NUM_DRONES, 4), dtype=np.float32),
+                high=np.ones((self.NUM_DRONES, 4), dtype=np.float32),
+                dtype=np.float32,
+            )
+        if fam not in _SAR_RGB_FAMILIES or self.ACT_TYPE != ActionType.VEL:
+            return space
+        low = np.concatenate(
+            [space.low, np.zeros((self.NUM_DRONES, 1), dtype=space.low.dtype)], axis=1
+        )
+        high = np.concatenate(
+            [space.high, np.ones((self.NUM_DRONES, 1), dtype=space.high.dtype)], axis=1
+        )
+        _reseed_buffer(low.shape[1])
+        return spaces.Box(low=low, high=high, dtype=np.float32)
+
+    def _preprocessAction(self, action):
+        """For SAR, coerce a wrong-width action to the env's action width before the base buffers
+        it, so a stray caller cannot corrupt the action-history buffer. The office family converts
+        its body-frame RC sticks here instead of in the base class. Production always sends the
+        right width (rpc clips to action_space); other families pass straight through unchanged."""
+        if getattr(self, "_office_rc_enabled", False):
+            return self._preprocess_rc_action(action)
+        if getattr(self, "_sar_rgb_enabled", False):
+            arr = np.asarray(action)
+            expected = int(self.action_space.shape[-1])
+            if arr.ndim == 2 and arr.shape[1] != expected:
+                fixed = np.zeros((arr.shape[0], expected), dtype=np.float32)
+                w = min(expected, arr.shape[1])
+                fixed[:, :w] = arr[:, :w]
+                return super()._preprocessAction(fixed)
+        return super()._preprocessAction(action)
+
+    def _preprocess_rc_action(self, action):
+        """Convert RC sticks [lr, fb, ud, yaw] to RPMs via the velocity PID.
+
+        The raw sticks enter the action-history buffer (that is all the real
+        controller would know); zero sticks command a hover.
+        """
+        # Contract: missing, non-finite, or wrong-shaped input canonicalizes to hover.
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.size != self.NUM_DRONES * 4 or not np.all(np.isfinite(arr)):
+            arr = np.zeros(self.NUM_DRONES * 4, dtype=np.float32)
+        action = arr.reshape(self.NUM_DRONES, 4)
+        self.action_buffer.append(action.copy())
+        rpm = np.zeros((self.NUM_DRONES, 4))
+        for k in range(self.NUM_DRONES):
+            rc = action[k].astype(np.float64)
+            rc[np.abs(rc) < self._rc_dead_zone] = 0.0
+            prev = self._rc_command[k]
+            rc = prev + np.clip(rc - prev, -self._rc_max_step, self._rc_max_step)
+            self._rc_command[k] = rc
+            cur_yaw = float(self.rpy[k, 2])
+            target_vel = rc_sticks_to_world_velocity(rc, cur_yaw, self.SPEED_LIMIT)
+            # persistent setpoint with clamped lead, so the stick's rate is
+            # tracked but the target cannot run away from a rate-limited frame
+            advanced = self._rc_target_yaw[k] + rc[3] * self.MAX_YAW_RATE * self.CTRL_TIMESTEP
+            lead = math.atan2(math.sin(advanced - cur_yaw), math.cos(advanced - cur_yaw))
+            lead = max(-OFFICE_RC_YAW_LEAD_RAD, min(OFFICE_RC_YAW_LEAD_RAD, lead))
+            self._rc_target_yaw[k] = target_yaw = cur_yaw + lead
+            rpm[k, :], _, _ = self.ctrl[k].computeControl(
+                control_timestep=self.CTRL_TIMESTEP,
+                cur_pos=self.pos[k],
+                cur_quat=self.quat[k],
+                cur_vel=self.vel[k],
+                cur_ang_vel=self.ang_v[k],
+                target_pos=self.pos[k],
+                target_rpy=np.array([0.0, 0.0, target_yaw]),
+                target_vel=target_vel,
+            )
+        return rpm
+
+    def _get_movement_pattern_from_seed(self, seed: int) -> str:
+        """Deterministically select movement pattern based on seed."""
+        if not self._moving:
+            return "static"
+        rng = np.random.RandomState(seed)
+        rng.rand()
+        rng.rand()
+        rng.rand()
+        rng.rand()
+        pattern_idx = rng.randint(0, len(PLATFORM_MOVEMENT_PATTERNS))
+        return PLATFORM_MOVEMENT_PATTERNS[pattern_idx]
+
+    def _init_platform_randomization(self, seed: int) -> None:
+        """Initialize randomized platform movement parameters."""
+        if not self._moving:
+            self._platform_speed = 0.0
+            self._platform_radius = 0.0
+            self._platform_delay = 0.0
+            self._platform_transition_time = 0.0
+            self._platform_phase = 0.0
+            self._platform_linear_dir = "x"
+            self._platform_linear_angle = 0.0
+            return
+
+        rng = np.random.RandomState((seed + 77777) & 0xFFFFFFFF)
+        self._platform_speed = rng.uniform(PLATFORM_SPEED_MIN, PLATFORM_SPEED_MAX)
+        self._platform_radius = rng.uniform(PLATFORM_RADIUS_MIN, PLATFORM_RADIUS_MAX)
+        self._platform_delay = rng.uniform(PLATFORM_DELAY_MIN, PLATFORM_DELAY_MAX)
+        self._platform_transition_time = rng.uniform(PLATFORM_TRANSITION_MIN, PLATFORM_TRANSITION_MAX)
+        self._platform_phase = rng.uniform(0, 2 * np.pi)
+        dir_idx = rng.randint(0, len(PLATFORM_LINEAR_DIRECTIONS))
+        self._platform_linear_dir = PLATFORM_LINEAR_DIRECTIONS[dir_idx]
+        self._platform_linear_angle = rng.uniform(0, 2 * np.pi)
+
+    def _get_orbit_position(self, t_eff: float) -> np.ndarray:
+        """Calculate orbit position for a given effective time."""
+        center = self._platform_orbit_center
+        speed = self._platform_speed
+        radius = self._platform_radius
+        phase = self._platform_phase
+        pattern = self._movement_pattern
+
+        if pattern == "circular":
+            angle = t_eff * speed * 0.3 + phase
+            x = center[0] + radius * math.cos(angle)
+            y = center[1] + radius * math.sin(angle)
+            return np.array([x, y, center[2]], dtype=np.float32)
+
+        elif pattern == "linear":
+            offset = radius * math.sin(t_eff * speed * 0.5 + phase)
+            if self._platform_linear_dir == "x":
+                x = center[0] + offset
+                y = center[1]
+            elif self._platform_linear_dir == "y":
+                x = center[0]
+                y = center[1] + offset
+            else:
+                x = center[0] + offset * math.cos(self._platform_linear_angle)
+                y = center[1] + offset * math.sin(self._platform_linear_angle)
+            return np.array([x, y, center[2]], dtype=np.float32)
+
+        elif pattern == "figure8":
+            angle = t_eff * speed * 0.3 + phase
+            x = center[0] + radius * math.sin(angle)
+            y = center[1] + radius * math.sin(2 * angle) / 2
+            return np.array([x, y, center[2]], dtype=np.float32)
+
+        return np.array(center, dtype=np.float32)
+
+    def _calculate_platform_position(self, t: float) -> np.ndarray:
+        """Calculate platform position at time t with smooth transition."""
+        if not self._moving:
+            return self._platform_orbit_center.copy()
+
+        delay = self._platform_delay
+        transition = self._platform_transition_time
+        center = self._platform_orbit_center
+
+        if t < delay:
+            return np.array(center, dtype=np.float32)
+
+        orbit_start = self._get_orbit_position(0.0)
+
+        if t < delay + transition:
+            t_ratio = (t - delay) / transition
+            t_smooth = t_ratio * t_ratio * (3.0 - 2.0 * t_ratio)
+            return center + t_smooth * (orbit_start - center)
+
+        t_eff = t - delay - transition
+        return self._get_orbit_position(t_eff)
+
+    def _platform_path_blocked(self, current_pos, target_pos):
+        """Check if path or destination is blocked by obstacles."""
+        cli = getattr(self, "CLIENT", 0)
+        direction = target_pos - current_pos
+        dist = np.linalg.norm(direction[:2])
+        if dist < 0.001:
+            return False, None
+
+        excluded = set(getattr(self, '_end_platform_uids', []))
+        excluded |= set(getattr(self, '_start_platform_uids', []))
+        excluded.add(self.DRONE_IDS[0])
+        excluded.add(getattr(self, 'PLANE_ID', 0))
+
+        offsets = [
+            np.array([0, 0, 0], dtype=np.float32),
+            np.array([LANDING_PLATFORM_RADIUS, 0, 0], dtype=np.float32),
+            np.array([-LANDING_PLATFORM_RADIUS, 0, 0], dtype=np.float32),
+            np.array([0, LANDING_PLATFORM_RADIUS, 0], dtype=np.float32),
+            np.array([0, -LANDING_PLATFORM_RADIUS, 0], dtype=np.float32),
+        ]
+
+        for offset in offsets:
+            ray_from = (current_pos + offset).tolist()
+            ray_to = (target_pos + offset).tolist()
+            result = p.rayTest(ray_from, ray_to, physicsClientId=cli)
+            if result and result[0][0] != -1 and result[0][0] not in excluded:
+                return True, np.array(result[0][3], dtype=np.float32)
+
+        end_uids = getattr(self, '_end_platform_uids', [])
+        if end_uids:
+            plat_uid = end_uids[0]
+            saved_pos, saved_orn = p.getBasePositionAndOrientation(plat_uid, physicsClientId=cli)
+            p.resetBasePositionAndOrientation(plat_uid, target_pos.tolist(), [0, 0, 0, 1], physicsClientId=cli)
+            num_bodies = p.getNumBodies(physicsClientId=cli)
+            for body_idx in range(num_bodies):
+                body_uid = p.getBodyUniqueId(body_idx, physicsClientId=cli)
+                if body_uid in excluded:
+                    continue
+                try:
+                    mn, mx = p.getAABB(body_uid, physicsClientId=cli)
+                except p.error:
+                    continue
+                if (mx[0] - mn[0]) > 50.0 or (mx[1] - mn[1]) > 50.0:
+                    continue
+                contacts = p.getClosestPoints(plat_uid, body_uid, distance=0.15, physicsClientId=cli)
+                if contacts:
+                    for c in contacts:
+                        if c[8] < 0.15:
+                            p.resetBasePositionAndOrientation(plat_uid, list(saved_pos), list(saved_orn), physicsClientId=cli)
+                            return True, target_pos.copy()
+            p.resetBasePositionAndOrientation(plat_uid, list(saved_pos), list(saved_orn), physicsClientId=cli)
+
+        return False, None
+
+    def _update_moving_platform(self):
+        """Update platform position with obstacle avoidance."""
+        nominal_pos = self._calculate_platform_position(self._time_alive)
+
+        if not self._moving:
+            self._prev_platform_pos = nominal_pos.copy()
+            self._current_platform_pos = nominal_pos
+            self._platform_velocity = np.zeros(3, dtype=np.float32)
+            return
+
+        current = self._current_platform_pos
+        if current is None:
+            current = nominal_pos
+
+        blocked, _ = self._platform_path_blocked(current, nominal_pos)
+
+        if not blocked or not PLATFORM_AVOIDANCE_ENABLED:
+            new_pos = nominal_pos
+        else:
+            direction = nominal_pos - current
+            raw_dist = np.linalg.norm(direction[:2])
+            step = np.clip(raw_dist * 0.3, PLATFORM_MIN_STEP_M, 0.10)
+            base_angle = math.atan2(direction[1], direction[0])
+
+            new_pos = current.copy()
+            for angle_deg in PLATFORM_STEER_ANGLES:
+                angle = base_angle + math.radians(angle_deg)
+                candidate = current.copy()
+                candidate[0] += step * math.cos(angle)
+                candidate[1] += step * math.sin(angle)
+                candidate[2] = nominal_pos[2]
+
+                candidate_blocked, _ = self._platform_path_blocked(current, candidate)
+                if not candidate_blocked:
+                    new_pos = candidate
+                    break
+
+        max_step_dist = self._platform_speed * self._sim_dt * 1.5
+        disp = new_pos - current
+        disp_dist = np.linalg.norm(disp[:2])
+        if disp_dist > max_step_dist > 0:
+            scale = max_step_dist / disp_dist
+            new_pos[0] = current[0] + disp[0] * scale
+            new_pos[1] = current[1] + disp[1] * scale
+
+        center = self._platform_orbit_center
+        rel = new_pos[:2] - center[:2]
+        r = np.linalg.norm(rel)
+        r_max = self._platform_radius + 0.3
+        if r > r_max:
+            new_pos[:2] = center[:2] + rel * (r_max / max(r, 1e-6))
+
+        if self._prev_platform_pos is not None:
+            dt = self._sim_dt
+            if dt > 0:
+                self._platform_velocity = (new_pos - self._prev_platform_pos) / dt
+
+        self._prev_platform_pos = new_pos.copy()
+        self._current_platform_pos = new_pos
+
+        if not hasattr(self, '_end_platform_uids') or not self._end_platform_uids:
+            return
+
+        cli = getattr(self, "CLIENT", 0)
+
+        if not self._platform_offsets and self._end_platform_uids:
+            initial_pos = self._platform_orbit_center
+            for uid in self._end_platform_uids:
+                pos, _ = p.getBasePositionAndOrientation(uid, physicsClientId=cli)
+                offset = np.array(pos, dtype=np.float32) - initial_pos
+                self._platform_offsets.append(offset)
+
+        for i, uid in enumerate(self._end_platform_uids):
+            offset = self._platform_offsets[i] if i < len(self._platform_offsets) else np.zeros(3)
+            final_pos = new_pos + offset
+            p.resetBasePositionAndOrientation(
+                uid,
+                final_pos.tolist(),
+                [0, 0, 0, 1],
+                physicsClientId=cli
+            )
+
+    def _update_landing_state(self, platform_contact: bool, nth_drone: int = 0) -> None:
+        """Update landing state machine based on contact and drone state."""
+        if self.NUM_DRONES > 1:
+            self._update_landing_state_multi(platform_contact, nth_drone)
+            return
+        if self._success or self._collision:
+            return
+
+        if not platform_contact:
+            self._landing_stable_time = 0.0
+            return
+
+        if self._moving:
+            self._success = True
+            self._t_to_goal = self._time_alive
+            return
+
+        state = self._getDroneStateVector(0)
+        roll, pitch = state[7], state[8]
+        vel = state[10:13]
+
+        vz = abs(vel[2])
+        drone_vxy = vel[0:2]
+        platform_vxy = self._platform_velocity[0:2]
+        rel_vxy = np.linalg.norm(drone_vxy - platform_vxy)
+
+        velocity_ok = vz <= LANDING_MAX_VZ and rel_vxy <= LANDING_MAX_VXY_REL
+        upright_ok = abs(roll) <= LANDING_MAX_TILT_RAD and abs(pitch) <= LANDING_MAX_TILT_RAD
+
+        if velocity_ok and upright_ok:
+            self._landing_stable_time += self._sim_dt
+            if self._landing_stable_time >= LANDING_STABLE_SEC:
+                self._success = True
+                self._t_to_goal = self._time_alive
+        else:
+            self._landing_stable_time = 0.0
+
+    def _is_landing_floor_body(self, body_uid: int, drone_pos, platform_pos=None) -> bool:
+        """Whether ``body_uid`` is the supporting floor under the landing platform
+        and should be ignored by safety scoring during the final descent."""
+        if getattr(self, "sar_mode", False):
+            return False
+        challenge_type = int(getattr(self.task, "challenge_type", 0))
+        if challenge_type not in (1, 4, 5, 6):
+            return False
+
+        safe = SAFETY_DISTANCE_SAFE_BY_TYPE.get(challenge_type, SAFETY_DISTANCE_SAFE)
+        if platform_pos is None:
+            platform_pos = self._current_platform_pos
+        if platform_pos is None:
+            platform_pos = self.GOAL_POS
+        if platform_pos is None:
+            return False
+        if platform_pos[2] >= safe:
+            return False
+
+        cli = getattr(self, "CLIENT", 0)
+        try:
+            mn, mx = p.getAABB(body_uid, physicsClientId=cli)
+        except p.error:
+            return False
+
+        if mx[2] >= platform_pos[2]:
+            return False
+        if (platform_pos[2] - mx[2]) >= safe:
+            return False
+        if (mx[2] - mn[2]) > LANDING_FLOOR_MAX_HEIGHT:
+            return False
+
+        landing_r = LANDING_PLATFORM_RADIUS + DRONE_HULL_RADIUS + LANDING_COLUMN_PADDING
+        landing_r_sq = landing_r * landing_r
+
+        cx = min(max(platform_pos[0], mn[0]), mx[0])
+        cy = min(max(platform_pos[1], mn[1]), mx[1])
+        body_dx = platform_pos[0] - cx
+        body_dy = platform_pos[1] - cy
+        if body_dx * body_dx + body_dy * body_dy > landing_r_sq:
+            return False
+
+        drone_dx = drone_pos[0] - platform_pos[0]
+        drone_dy = drone_pos[1] - platform_pos[1]
+        if drone_dx * drone_dx + drone_dy * drone_dy > landing_r_sq:
+            return False
+
+        if drone_pos[2] > platform_pos[2] + safe + LANDING_ALTITUDE_BUFFER:
+            return False
+
+        return True
+
+    def _drone_camera_view(self, nth_drone):
+        cli = getattr(self, "CLIENT", 0)
+        drone_pos = self.pos[nth_drone, :]
+        rot_mat = np.array(p.getMatrixFromQuaternion(self.quat[nth_drone, :])).reshape(3, 3)
+
+        forward = rot_mat @ np.array([1.0, 0.0, 0.0])
+        forward = forward / np.linalg.norm(forward)
+        up = rot_mat @ np.array([0.0, 0.0, 1.0])
+
+        fwd_eye = (OFFICE_CAMERA_EYE_FWD_M
+                   if getattr(self, "_office_rc_enabled", False) else CAMERA_EYE_FWD_M)
+        camera_pos = drone_pos + forward * fwd_eye + up * CAMERA_EYE_UP_M
+
+        target = camera_pos + forward * 20.0
+
+        return p.computeViewMatrix(
+            cameraEyePosition=camera_pos,
+            cameraTargetPosition=target,
+            cameraUpVector=up.tolist(),
+            physicsClientId=cli
+        )
+
+    def _drone_proj_matrix(self):
+        cli = getattr(self, "CLIENT", 0)
+        if self._cached_proj_matrix is None:
+            aspect = self.IMG_RES[0] / self.IMG_RES[1]
+            self._cached_proj_matrix = p.computeProjectionMatrixFOV(
+                fov=self._fov,
+                aspect=aspect,
+                nearVal=0.05,
+                farVal=getattr(self, "_depth_far_m", DEPTH_FAR),
+                physicsClientId=cli
+            )
+        return self._cached_proj_matrix
+
+    def _getDroneImages(self, nth_drone, segmentation: bool = False):
+        """Get camera images from drone. Returns (rgb, depth, seg) but we only use depth."""
+        if self.OBS_TYPE != ObservationType.RGB:
+            return super()._getDroneImages(nth_drone, segmentation)
+
+        if self.IMG_RES is None:
+            print("[ERROR] in MovingDroneAviary._getDroneImages(), IMG_RES not set")
+            exit()
+
+        cli = getattr(self, "CLIENT", 0)
+        DRONE_CAM_VIEW = self._drone_camera_view(nth_drone)
+        DRONE_CAM_PRO = self._drone_proj_matrix()
+
+        # The office contract observes COLOR: keep the shaded output and pass the
+        # episode's randomized light color. Everyone else renders depth-only.
+        office = getattr(self, "_office_rc_enabled", False)
+        seg_flag = p.ER_NO_SEGMENTATION_MASK
+        extra_kwargs = {}
+        if office:
+            extra_kwargs["lightColor"] = self._light_color
+        else:
+            depth_only_flag = getattr(p, "ER_DEPTH_ONLY", None)
+            if depth_only_flag is not None:
+                seg_flag |= depth_only_flag
+        if self._sun is not None:
+            extra_kwargs.update(sun_render_kwargs(self._sun))
+        extra_kwargs.update(self._sky_kwargs())
+        [w, h, rgb, dep, _seg] = p.getCameraImage(
+            width=self.IMG_RES[0],
+            height=self.IMG_RES[1],
+            shadow=0,
+            renderer=p.ER_TINY_RENDERER,
+            viewMatrix=DRONE_CAM_VIEW,
+            projectionMatrix=DRONE_CAM_PRO,
+            lightDirection=self._light_direction,
+            flags=seg_flag | self._render_flags,
+            physicsClientId=cli,
+            **extra_kwargs
+        )
+
+        dep = np.reshape(dep, (h, w))
+        return (np.reshape(rgb, (h, w, 4)) if office else None), dep, None
+
+    def _sky_kwargs(self) -> dict:
+        """getCameraImage arguments for the family's sky; empty when it keeps the white background."""
+        if self._sky_colors is None:
+            return {}
+        horizon, zenith = self._sky_colors
+        return {"skyHorizonColor": list(horizon), "skyZenithColor": list(zenith)}
+
+    def _get_altitude_distance(self, nth_drone: int = 0) -> float:
+        """Cast single ray downward for ground/altitude detection."""
+        cli = getattr(self, "CLIENT", 0)
+        pos = self.pos[nth_drone]
+
+        ray_origin_offset = getattr(self, "_alt_ray_origin_offset", DRONE_HULL_RADIUS - ALTITUDE_RAY_INSET)
+        start = [pos[0], pos[1], pos[2] - ray_origin_offset]
+        end = [pos[0], pos[1], pos[2] - MAX_RAY_DISTANCE]
+
+        result = p.rayTest(start, end, physicsClientId=cli)
+        hit_uid, _, hit_frac, _, _ = result[0]
+
+        if hit_uid != -1:
+            seg_len = MAX_RAY_DISTANCE - ray_origin_offset
+            return min(MAX_RAY_DISTANCE, ray_origin_offset + hit_frac * seg_len)
+        return MAX_RAY_DISTANCE
+
+    def _process_depth(self, depth_buffer: np.ndarray, out: np.ndarray = None) -> np.ndarray:
+        """Convert PyBullet depth buffer to a normalized depth map in [0,1].
+
+        Range is env-local (``_depth_far_m`` / ``_depth_max_m``): cf_interceptor sees out to
+        ~100 m, the SAR families to 30 m, and the rest keep the 0.5-20 m default.
+        ``out`` may supply a float32 destination of the buffer's shape to avoid
+        the intermediate allocation; the math is unchanged either way.
+        """
+        far = getattr(self, "_depth_far_m", DEPTH_FAR)
+        dmax = getattr(self, "_depth_max_m", DEPTH_MAX_M)
+        if (
+            out is not None
+            and depth_buffer.dtype == np.float32
+            and out.shape == depth_buffer.shape
+        ):
+            out = np.clip(depth_buffer, 0.0, 1.0, out=out)
+        else:
+            out = np.clip(depth_buffer, 0.0, 1.0)
+        out *= far - DEPTH_NEAR
+        np.subtract(far, out, out=out)
+        np.maximum(out, DEPTH_NEAR * 1e-6, out=out)
+        np.divide(far * DEPTH_NEAR, out, out=out)
+        np.clip(out, DEPTH_MIN_M, dmax, out=out)
+        out -= DEPTH_MIN_M
+        out /= dmax - DEPTH_MIN_M
+        return out.astype(np.float32, copy=False)[..., np.newaxis]
+
+    def _check_collision(self, nth_drone: int = 0) -> tuple:
+        """Inspect contact points; sets ``_collision`` on any non-platform impact.
+
+        Returns a ``(platform_hit, obstacle_hit)`` tuple. ``platform_hit`` is True when
+        the drone touches a goal-platform pad (the landing target). Touching a mannequin
+        part (victim) is treated as an obstacle hit — the no-touch sphere governs the
+        CONFIRMED predicate, not contact handling.
+        """
+        drone_id = self.DRONE_IDS[nth_drone]
+        if self.NUM_DRONES > 1:
+            self._d_touch_platform[nth_drone] = None
+        contact_points = p.getContactPoints(
+            bodyA=drone_id,
+            physicsClientId=getattr(self, "CLIENT", 0)
+        )
+
+        if not contact_points:
+            return False, False
+
+        # Pads are landing targets, not obstacles; SAR also exempts the ground plane.
+        # For the swarm, a drone may land on any UNCLAIMED logical platform (a platform
+        # is a group of body uids); claimed platforms drop to the obstacle-exempt path.
+        uid_to_group: dict = {}
+        if self.NUM_DRONES > 1:
+            groups = getattr(self, "_swarm_platform_groups", ())
+            claimed = getattr(self, "_swarm_claimed", frozenset())
+            uid_to_group = getattr(self, "_swarm_uid_to_group", {})
+            end_platform_uids = set()
+            for gi, grp in enumerate(groups):
+                if gi not in claimed:
+                    end_platform_uids |= set(grp)
+        else:
+            end_platform_uids = getattr(self, '_end_platform_uids', ())
+        exempt = {drone_id} | getattr(self, "_platform_uids", frozenset())
+        exempt = exempt | getattr(self, "_collision_exempt_uids", frozenset())
+        if getattr(self, "sar_mode", False):
+            exempt = exempt | {getattr(self, "PLANE_ID", 0)}
+        platform_hit = False
+        obstacle_hit = False
+        touched_platform = None
+
+        for contact in contact_points:
+            body_b = contact[2]
+            if body_b == -1:
+                continue
+
+            normal_force = contact[9]
+            if normal_force <= 0.01:
+                continue
+
+            if body_b in end_platform_uids:
+                platform_hit = True
+                if self.NUM_DRONES > 1:
+                    touched_platform = uid_to_group.get(body_b)
+                continue
+            if body_b in exempt:
+                continue
+
+            obstacle_hit = True
+            break
+
+        if self.NUM_DRONES > 1:
+            self._d_touch_platform[nth_drone] = touched_platform
+            if obstacle_hit:
+                self._d_collision[nth_drone] = True
+        elif obstacle_hit:
+            self._collision = True
+
+        return platform_hit, obstacle_hit
+
+
+    @staticmethod
+    def _count_mesh_faces(path: str) -> int:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return 0
+        return _count_obj_faces_cached(path, st.st_mtime_ns, st.st_size)
+
+    def _build_cull_targets(self) -> None:
+        """Scan scene bodies and build the cull-target list."""
+        cli = getattr(self, "CLIENT", 0)
+        drone_id = self.DRONE_IDS[0]
+        ground_id = getattr(self, "PLANE_ID", 0)
+        protected = (
+            {drone_id, ground_id}
+            | set(self.family_runtime.protected_body_uids(self))
+        )
+
+        targets = []
+        total_faces = 0
+        n = p.getNumBodies(physicsClientId=cli)
+
+        for i in range(n):
+            uid = p.getBodyUniqueId(i, physicsClientId=cli)
+            if uid in protected:
+                continue
+            try:
+                mn, mx = p.getAABB(uid, physicsClientId=cli)
+            except p.error:
+                continue
+            span = max(mx[0] - mn[0], mx[1] - mn[1])
+            if span < CULL_MIN_AABB_SPAN:
+                continue
+            vdata = p.getVisualShapeData(uid, physicsClientId=cli)
+            if not vdata:
+                continue
+            faces = 0
+            for v in vdata:
+                if v[2] == p.GEOM_MESH:
+                    fname = v[4].decode() if isinstance(v[4], bytes) else str(v[4])
+                    faces += self._count_mesh_faces(fname)
+            if faces < CULL_MIN_FACES:
+                continue
+            cx = (mn[0] + mx[0]) * 0.5
+            cy = (mn[1] + mx[1]) * 0.5
+            rgba_orig = list(vdata[0][7])
+            # Remember the collision filter because culling temporarily replaces it.
+            restore_filter = (
+                (2, 1)
+                if p.getDynamicsInfo(uid, -1, physicsClientId=cli)[0] == 0
+                else (1, 0xFF)
+            )
+            targets.append((uid, cx, cy, span / 2.0, rgba_orig, restore_filter))
+            total_faces += faces
+
+        self._cull_targets = targets
+        self._cull_vis_hidden = set()
+        self._cull_phys_disabled = set()
+        self._cull_step_counter = 0
+        self._cull_enabled = (
+            (not getattr(self, "GUI", False))
+            and total_faces >= CULL_MIN_TOTAL_FACES
+            and self.NUM_DRONES == 1
+        )
+
+    def _apply_distance_cull(self) -> None:
+        """Toggle visual/physics state for bodies beyond camera range."""
+        if getattr(self, "GUI", False):
+            if self._cull_vis_hidden or self._cull_phys_disabled:
+                self._restore_culled_bodies()
+            return
+        if not self._cull_enabled:
+            return
+        self._cull_step_counter += 1
+        if self._cull_step_counter % CULL_INTERVAL_STEPS != 0:
+            return
+
+        cli = getattr(self, "CLIENT", 0)
+        dp = p.getBasePositionAndOrientation(self.DRONE_IDS[0], physicsClientId=cli)[0]
+        dx, dy = dp[0], dp[1]
+        vis_hidden = self._cull_vis_hidden
+        phys_disabled = self._cull_phys_disabled
+        # The ray caster's frame cost does not grow with the bodies in view, so it keeps far bodies.
+        hide_visuals = not getattr(self, "_raycast_enabled", False)
+
+        for uid, cx, cy, hs, rgba, restore_filter in self._cull_targets:
+            dist = math.sqrt((cx - dx) ** 2 + (cy - dy) ** 2)
+            surface_dist = dist - hs
+
+            if hide_visuals and surface_dist > CULL_VISUAL_RADIUS:
+                if uid not in vis_hidden:
+                    p.changeVisualShape(uid, -1, rgbaColor=[0, 0, 0, 0], physicsClientId=cli)
+                    vis_hidden.add(uid)
+            elif uid in vis_hidden:
+                p.changeVisualShape(uid, -1, rgbaColor=rgba, physicsClientId=cli)
+                vis_hidden.discard(uid)
+
+            if surface_dist > CULL_PHYSICS_RADIUS:
+                if uid not in phys_disabled:
+                    p.setCollisionFilterGroupMask(uid, -1, 0, 0, physicsClientId=cli)
+                    phys_disabled.add(uid)
+            elif uid in phys_disabled:
+                p.setCollisionFilterGroupMask(
+                    uid, -1, *restore_filter, physicsClientId=cli
+                )
+                phys_disabled.discard(uid)
+
+    def _restore_culled_bodies(self) -> None:
+        """Restore all culled bodies to their original state."""
+        cli = getattr(self, "CLIENT", 0)
+        for uid, _, _, _, rgba, restore_filter in self._cull_targets:
+            if uid in self._cull_vis_hidden:
+                p.changeVisualShape(uid, -1, rgbaColor=rgba, physicsClientId=cli)
+            if uid in self._cull_phys_disabled:
+                p.setCollisionFilterGroupMask(
+                    uid, -1, *restore_filter, physicsClientId=cli
+                )
+        self._cull_vis_hidden.clear()
+        self._cull_phys_disabled.clear()
+
+
+    def _record_takeoff_origins(self) -> None:
+        """Remember where each drone was placed, so the spawn cannot seed the episode minimum."""
+        self._takeoff_origins = np.array(self.pos[:, :3], dtype=float)
+        self._takeoff_cleared = np.zeros(self.NUM_DRONES, dtype=bool)
+
+    def _in_takeoff_grace(self, nth_drone: int) -> bool:
+        """Whether the drone is still inside the sphere it was placed in.
+
+        The spawn sits below SAFETY_DISTANCE_DANGER of its own pad and the episode keeps
+        the minimum, so scoring there would make our placement permanent. Grace ends once
+        the drone has flown the distance this map calls fully safe, which is the point the
+        launch surface stops costing anything. The latch is one-way.
+        """
+        if self._takeoff_cleared is None or self._takeoff_cleared[nth_drone]:
+            return False
+        challenge_type = int(getattr(self.task, "challenge_type", 0))
+        clear_at = SAFETY_DISTANCE_SAFE_BY_TYPE.get(challenge_type, SAFETY_DISTANCE_SAFE)
+        travelled = float(np.linalg.norm(
+            self.pos[nth_drone, :3] - self._takeoff_origins[nth_drone]
+        ))
+        if travelled < clear_at:
+            return True
+        self._takeoff_cleared[nth_drone] = True
+        return False
+
+    def _update_min_clearance(self) -> None:
+        """Update minimum obstacle clearance for the episode."""
+        if getattr(self, "_office_rc_enabled", False):
+            # Office scoring never reads clearance, and getClosestPoints against
+            # the office's concave meshes can segfault the process (seed 53).
+            return
+        if self.NUM_DRONES > 1:
+            self._update_min_clearance_multi()
+            return
+        if self._collision:
+            self._min_clearance_episode = 0.0
+            return
+        if self._in_takeoff_grace(0):
+            return
+
+        cli = getattr(self, "CLIENT", 0)
+        drone_id = self.DRONE_IDS[0]
+        ground_id = getattr(self, 'PLANE_ID', 0)
+        excluded = {drone_id, -1, ground_id}
+
+        excluded |= set(self.family_runtime.protected_body_uids(self))
+        safety_patch = self.family_runtime.safety_patch(self)
+
+        min_dist = SAFETY_DISTANCE_SAFE
+
+        d_min, d_max = p.getAABB(drone_id, physicsClientId=cli)
+        search_min = [d_min[0] - SAFETY_DISTANCE_SAFE, d_min[1] - SAFETY_DISTANCE_SAFE, d_min[2] - SAFETY_DISTANCE_SAFE]
+        search_max = [d_max[0] + SAFETY_DISTANCE_SAFE, d_max[1] + SAFETY_DISTANCE_SAFE, d_max[2] + SAFETY_DISTANCE_SAFE]
+        overlapping = p.getOverlappingObjects(search_min, search_max, physicsClientId=cli)
+
+        if overlapping:
+            drone_pos = self.pos[0, :]
+            checked = set()
+            for body_uid, _link_idx in overlapping:
+                if body_uid in excluded or body_uid in checked:
+                    continue
+                checked.add(body_uid)
+                if self._is_landing_floor_body(body_uid, drone_pos):
+                    continue
+                closest = p.getClosestPoints(
+                    bodyA=drone_id,
+                    bodyB=body_uid,
+                    distance=SAFETY_DISTANCE_SAFE,
+                    physicsClientId=cli
+                )
+
+                for point in closest:
+                    contact = point[6]
+                    if (
+                        safety_patch is not None
+                        and body_uid == safety_patch.support_uid
+                        and _inside_safety_patch(contact, safety_patch)
+                    ):
+                        continue
+                    dist = point[8]
+                    if dist < min_dist:
+                        min_dist = dist
+
+        if min_dist < self._min_clearance_episode:
+            self._min_clearance_episode = min_dist
+
+    # --------------------------------------------------------------------- #
+    # 2b. multi-drone (swarm) bookkeeping — only active when num_drones > 1
+    # --------------------------------------------------------------------- #
+    def _freeze_drone(self, nth_drone: int) -> None:
+        """Park a resolved drone in place; it stays a static collision obstacle."""
+        cli = getattr(self, "CLIENT", 0)
+        uid = int(self.DRONE_IDS[nth_drone])
+        p.resetBaseVelocity(uid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cli)
+        p.changeDynamics(uid, -1, mass=0.0, physicsClientId=cli)
+        self._frozen[nth_drone] = True
+
+    def _update_landing_state_multi(self, platform_contact: bool, nth_drone: int) -> None:
+        from swarm.protocol import FailureReason
+
+        if self._d_success[nth_drone] or self._d_collision[nth_drone]:
+            return
+        if not platform_contact:
+            self._d_landing_stable_time[nth_drone] = 0.0
+            return
+
+        state = self._getDroneStateVector(nth_drone)
+        roll, pitch = state[7], state[8]
+        vel = state[10:13]
+        vz = abs(vel[2])
+        rel_vxy = float(np.linalg.norm(vel[0:2]))
+        velocity_ok = vz <= LANDING_MAX_VZ and rel_vxy <= LANDING_MAX_VXY_REL
+        upright_ok = abs(roll) <= LANDING_MAX_TILT_RAD and abs(pitch) <= LANDING_MAX_TILT_RAD
+
+        if velocity_ok and upright_ok:
+            self._d_landing_stable_time[nth_drone] += self._sim_dt
+            if self._d_landing_stable_time[nth_drone] >= LANDING_STABLE_SEC:
+                self._d_success[nth_drone] = True
+                self._d_t_to_goal[nth_drone] = self._time_alive
+                self._d_failure_reason[nth_drone] = FailureReason.NONE.value
+                claimed_uid = self._d_touch_platform[nth_drone]
+                claimed_set = getattr(self, "_swarm_claimed", None)
+                if claimed_uid is not None and claimed_set is not None:
+                    claimed_set.add(int(claimed_uid))
+        else:
+            self._d_landing_stable_time[nth_drone] = 0.0
+
+    def _update_min_clearance_multi(self) -> None:
+        """Per-drone obstacle clearance; teammates are excluded so swarm
+        proximity never lowers the safety term (only real impacts do)."""
+        cli = getattr(self, "CLIENT", 0)
+        ground_id = getattr(self, "PLANE_ID", 0)
+        live_teammates = {
+            int(self.DRONE_IDS[j])
+            for j in range(self.NUM_DRONES)
+            if not self._frozen[j]
+        }
+        base_excluded = {-1, ground_id} | live_teammates | set(
+            self.family_runtime.protected_body_uids(self)
+        )
+        safety_patch = self.family_runtime.safety_patch(self)
+        for i in range(self.NUM_DRONES):
+            if self._frozen[i]:
+                continue
+            if self._d_collision[i]:
+                self._d_min_clearance[i] = 0.0
+                continue
+            if self._in_takeoff_grace(i):
+                continue
+            drone_id = self.DRONE_IDS[i]
+            drone_pos = self.pos[i, :]
+            goal_i = self.GOAL_POSES[i]
+            min_dist = SAFETY_DISTANCE_SAFE
+            d_min, d_max = p.getAABB(drone_id, physicsClientId=cli)
+            search_min = [d_min[k] - SAFETY_DISTANCE_SAFE for k in range(3)]
+            search_max = [d_max[k] + SAFETY_DISTANCE_SAFE for k in range(3)]
+            overlapping = p.getOverlappingObjects(search_min, search_max, physicsClientId=cli)
+            if overlapping:
+                checked = set()
+                for body_uid, _link_idx in overlapping:
+                    if body_uid in base_excluded or body_uid in checked:
+                        continue
+                    checked.add(body_uid)
+                    if self._is_landing_floor_body(body_uid, drone_pos, platform_pos=goal_i):
+                        continue
+                    closest = p.getClosestPoints(
+                        bodyA=drone_id, bodyB=body_uid,
+                        distance=SAFETY_DISTANCE_SAFE, physicsClientId=cli,
+                    )
+                    for point in closest:
+                        if (
+                            safety_patch is not None
+                            and body_uid == safety_patch.support_uid
+                            and _inside_safety_patch(point[6], safety_patch)
+                        ):
+                            continue
+                        dist = point[8]
+                        if dist < min_dist:
+                            min_dist = dist
+            if min_dist < self._d_min_clearance[i]:
+                self._d_min_clearance[i] = min_dist
+
+    def _process_step_updates_multi(self) -> None:
+        from swarm.protocol import FailureReason
+
+        froze_any = False
+        for i in range(self.NUM_DRONES):
+            if self._frozen[i]:
+                continue
+            platform_hit, _obstacle = self._check_collision(i)
+            state = self._getDroneStateVector(i)
+            if not self._d_success[i] and (
+                abs(state[7]) > self.MAX_TILT_RAD or abs(state[8]) > self.MAX_TILT_RAD
+            ):
+                self._d_collision[i] = True
+                if self._d_failure_reason[i] == FailureReason.NONE.value:
+                    self._d_failure_reason[i] = FailureReason.TILT.value
+            if getattr(self, "sar_mode", False):
+                self.family_runtime.update_sar_dwell_multi(self, i)
+            else:
+                self._update_landing_state_multi(platform_hit, i)
+            if self._d_collision[i] and not self._d_success[i]:
+                if self._d_failure_reason[i] == FailureReason.NONE.value:
+                    self._d_failure_reason[i] = FailureReason.OBSTACLE_COLLISION.value
+            if self._d_success[i] or self._d_collision[i]:
+                self._freeze_drone(i)
+                froze_any = True
+        self._update_min_clearance_multi()
+        self._apply_distance_cull()
+        if froze_any:
+            self._updateAndStoreKinematicInformation()
+
+    # --------------------------------------------------------------------- #
+    # 3. OpenAI‑Gym API overrides
+    # --------------------------------------------------------------------- #
+    def reset(self, **kwargs):
+        """Reset environment and internal state for a new episode."""
+        seed = kwargs.get('seed', None)
+        if seed is None:
+            seed = getattr(self.task, 'map_seed', None)
+
+        p.resetSimulation(physicsClientId=self.CLIENT)
+        self._housekeeping()
+        self._updateAndStoreKinematicInformation()
+        self._startVideoRecording()
+
+        self._time_alive = 0.0
+        self._success = False
+        self._collision = False
+        self._t_to_goal = None
+        self._step_processed = False
+        self._min_clearance_episode = SAFETY_DISTANCE_SAFE
+        self._landing_stable_time = 0.0
+        self._prev_platform_pos = None
+        self._platform_velocity = np.zeros(3, dtype=np.float32)
+        self._platform_offsets = []
+        self._platform_hit = False
+
+        n = self.NUM_DRONES
+        self._frozen = np.zeros(n, dtype=bool)
+        self._d_success = np.zeros(n, dtype=bool)
+        self._d_collision = np.zeros(n, dtype=bool)
+        self._d_t_to_goal = [None] * n
+        self._d_min_clearance = np.full(n, SAFETY_DISTANCE_SAFE, dtype=float)
+        self._d_landing_stable_time = np.zeros(n, dtype=float)
+        self._d_touch_platform = [None] * n
+
+        from swarm.protocol import FailureReason
+        self._failure_reason = FailureReason.NONE.value
+        self._d_failure_reason = [FailureReason.NONE.value] * n
+        wind_model = getattr(self, "_wind", None)
+        if wind_model is not None:
+            wind_model.reset()
+        self.family_runtime.reset_env_state(self)
+
+        if getattr(self, "_sar_rgb_enabled", False):
+            self._rgb_request_count[:] = 0
+            self._rgb_buffer.fill(0.0)
+            self._rgb_dirty = False
+
+        if getattr(self, "_office_rc_enabled", False):
+            self._rc_command.fill(0.0)
+            self._rc_target_yaw.fill(0.0)
+            self._office_rpm.fill(self.HOVER_RPM)
+
+        # Fresh episode, fresh controllers: PID integrators must not leak across resets.
+        for ctrl in getattr(self, "ctrl", []):
+            ctrl.reset()
+
+        self._reset_action_buffer()
+
+        if self.NUM_DRONES > 1:
+            self._prev_score = 0.0
+        else:
+            self._prev_score = evaluate_rollout(
+                task=self.task,
+                success=False,
+                t=0.0,
+                horizon=self.EP_LEN_SEC,
+                min_clearance=self._min_clearance_episode,
+                collision=self._collision,
+                failure_reason=self._failure_reason,
+            ).score
+
+        self.family_runtime.spawn_task_world(self)
+        self._updateAndStoreKinematicInformation()
+        self._record_takeoff_origins()
+
+        cli = getattr(self, "CLIENT", 0)
+        p.setPhysicsEngineParameter(
+            numSolverIterations=SOLVER_ITERATIONS,
+            minimumSolverIslandSize=SOLVER_MIN_ISLAND_SIZE,
+            physicsClientId=cli,
+        )
+        self._isolate_static_collisions()
+
+        self.observation_space = observation_space(self._obs_layout, self)
+        self._state_dim = observation_vector_dim(self._obs_layout, self) or 0
+        obs_after = self._computeObs()
+        info_after = self._computeInfo()
+        return obs_after, info_after
+
+    def _isolate_static_collisions(self) -> None:
+        """Put every static body (and its links) in a collision group that meets
+        the drones but not other statics. Static-vs-static contact manifolds
+        carry no forces and nothing reads them, yet on dense maps the solver
+        burns milliseconds per step maintaining them. Runs after every world
+        (re)build."""
+        cli = getattr(self, "CLIENT", 0)
+        skip = {int(uid) for uid in self.DRONE_IDS}
+        target_uid = getattr(self, "_target_uid", None)
+        if target_uid is not None:
+            skip.add(int(target_uid))
+        for i in range(p.getNumBodies(physicsClientId=cli)):
+            uid = p.getBodyUniqueId(i, physicsClientId=cli)
+            if uid in skip:
+                continue
+            if p.getDynamicsInfo(uid, -1, physicsClientId=cli)[0] > 0:
+                continue
+            for link in range(-1, p.getNumJoints(uid, physicsClientId=cli)):
+                p.setCollisionFilterGroupMask(uid, link, 2, 1, physicsClientId=cli)
+
+    def step(self, action):
+        """Execute one control step with post-physics bookkeeping."""
+        self._step_processed = False
+        if self.RECORD and not self.GUI and self.step_counter % self.CAPTURE_FREQ == 0:
+            [w, h, rgb, dep, seg] = p.getCameraImage(
+                width=self.VID_WIDTH,
+                height=self.VID_HEIGHT,
+                shadow=1,
+                viewMatrix=self.CAM_VIEW,
+                projectionMatrix=self.CAM_PRO,
+                renderer=p.ER_TINY_RENDERER,
+                flags=p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX,
+                physicsClientId=self.CLIENT,
+                **self._sky_kwargs(),
+            )
+            (Image.fromarray(np.reshape(rgb, (h, w, 4)), 'RGBA')).save(
+                os.path.join(self.IMG_PATH, "frame_" + str(self.FRAME_NUM) + ".png")
+            )
+            self.FRAME_NUM += 1
+            if self.VISION_ATTR:
+                for i in range(self.NUM_DRONES):
+                    self.rgb[i], self.dep[i], self.seg[i] = self._getDroneImages(i)
+                    self._exportImage(
+                        img_type=ImageType.RGB,
+                        img_input=self.rgb[i],
+                        path=self.ONBOARD_IMG_PATH + "/drone_" + str(i) + "/",
+                        frame_num=int(self.step_counter / self.IMG_CAPTURE_FREQ),
+                    )
+        if self.GUI and self.USER_DEBUG:
+            current_input_switch = p.readUserDebugParameter(
+                self.INPUT_SWITCH,
+                physicsClientId=self.CLIENT,
+            )
+            if current_input_switch > self.last_input_switch:
+                self.last_input_switch = current_input_switch
+                self.USE_GUI_RPM = not self.USE_GUI_RPM
+        if self.USE_GUI_RPM:
+            for i in range(4):
+                self.gui_input[i] = p.readUserDebugParameter(
+                    int(self.SLIDERS[i]),
+                    physicsClientId=self.CLIENT,
+                )
+            clipped_action = np.tile(self.gui_input, (self.NUM_DRONES, 1))
+            if self.step_counter % (self.PYB_FREQ / 2) == 0:
+                self.GUI_INPUT_TEXT = [
+                    p.addUserDebugText(
+                        "Using GUI RPM",
+                        textPosition=[0, 0, 0],
+                        textColorRGB=[1, 0, 0],
+                        lifeTime=1,
+                        textSize=2,
+                        parentObjectUniqueId=self.DRONE_IDS[i],
+                        parentLinkIndex=-1,
+                        replaceItemUniqueId=int(self.GUI_INPUT_TEXT[i]),
+                        physicsClientId=self.CLIENT,
+                    ) for i in range(self.NUM_DRONES)
+                ]
+        else:
+            clipped_action = np.reshape(
+                self._preprocessAction(action),
+                (self.NUM_DRONES, 4),
+            )
+        self._update_moving_platform()
+        self.family_runtime.advance_world(self)
+        wind_model = getattr(self, "_wind", None)
+        wind = None if wind_model is None else wind_model.velocity(self._time_alive)
+        for _ in range(self.PYB_STEPS_PER_CTRL):
+            if (
+                self.PYB_STEPS_PER_CTRL > 1
+                and (
+                    # Office substep forces read live kinematics; plain PYB elsewhere is untouched.
+                    getattr(self, "_office_rc_enabled", False)
+                    or self.PHYSICS in [
+                        Physics.DYN,
+                        Physics.PYB_GND,
+                        Physics.PYB_DRAG,
+                        Physics.PYB_DW,
+                        Physics.PYB_GND_DRAG_DW,
+                    ]
+                )
+            ):
+                self._updateAndStoreKinematicInformation()
+            for i in range(self.NUM_DRONES):
+                if self.NUM_DRONES > 1 and self._frozen[i]:
+                    continue
+                if self.PHYSICS == Physics.PYB:
+                    if getattr(self, "_office_rc_enabled", False):
+                        self._office_rpm[i] += self._office_motor_alpha * (
+                            clipped_action[i, :] - self._office_rpm[i]
+                        )
+                        self._physics(self._office_rpm[i], i)
+                    else:
+                        self._physics(clipped_action[i, :], i)
+                elif self.PHYSICS == Physics.DYN:
+                    self._dynamics(clipped_action[i, :], i)
+                elif self.PHYSICS == Physics.PYB_GND:
+                    self._physics(clipped_action[i, :], i)
+                    self._groundEffect(clipped_action[i, :], i)
+                elif self.PHYSICS == Physics.PYB_DRAG:
+                    self._physics(clipped_action[i, :], i)
+                    self._drag(self.last_clipped_action[i, :], i)
+                elif self.PHYSICS == Physics.PYB_DW:
+                    self._physics(clipped_action[i, :], i)
+                    self._downwash(i)
+                elif self.PHYSICS == Physics.PYB_GND_DRAG_DW:
+                    self._physics(clipped_action[i, :], i)
+                    self._groundEffect(clipped_action[i, :], i)
+                    self._drag(self.last_clipped_action[i, :], i)
+                    self._downwash(i)
+                if wind is not None and self.PHYSICS != Physics.DYN:
+                    self._apply_wind(clipped_action[i, :], i, wind)
+            self.family_runtime.apply_world_physics(self)
+            if self.PHYSICS != Physics.DYN:
+                p.stepSimulation(physicsClientId=self.CLIENT)
+            self.last_clipped_action = clipped_action
+        self._updateAndStoreKinematicInformation()
+        self._process_step_updates()
+        self._update_rgb_requests(action)
+        obs = self._computeObs()
+        reward = self._computeReward()
+        terminated = self._computeTerminated()
+        truncated = self._computeTruncated()
+        info = self._computeInfo()
+        self.step_counter = self.step_counter + (1 * self.PYB_STEPS_PER_CTRL)
+        return obs, reward, terminated, truncated, info
+
+    def _apply_wind(self, rpm, nth_drone: int, wind) -> None:
+        """Rotor drag on the air moving relative to the drone, the drone's own URDF
+        coefficient times total rotor speed, so wind pushes a hovering drone and brakes a
+        flying one. Written as scalar math so every CPU produces the same bytes."""
+        vx, vy, vz = (float(c) for c in self.vel[nth_drone])
+        rx, ry, rz = vx - float(wind[0]), vy - float(wind[1]), vz - float(wind[2])
+        m = p.getMatrixFromQuaternion(self.quat[nth_drone])
+        # rows of m^T: relative airspeed in the body frame, where the URDF coefficients live
+        bx = m[0] * rx + m[3] * ry + m[6] * rz
+        by = m[1] * rx + m[4] * ry + m[7] * rz
+        bz = m[2] * rx + m[5] * ry + m[8] * rz
+        omega = (float(rpm[0]) + float(rpm[1]) + float(rpm[2]) + float(rpm[3])) * (2.0 * math.pi / 60.0)
+        kxy, kz = -float(self.DRAG_COEFF[0]) * omega, -float(self.DRAG_COEFF[2]) * omega
+        p.applyExternalForce(
+            int(self.DRONE_IDS[nth_drone]), -1, [kxy * bx, kxy * by, kz * bz], [0.0, 0.0, 0.0],
+            p.LINK_FRAME, physicsClientId=self.CLIENT,
+        )
+
+    def _process_step_updates(self):
+        """Handle post-physics episode bookkeeping exactly once per control step."""
+        if self._step_processed:
+            return
+        self._step_processed = True
+        self._time_alive += self._sim_dt
+        if self.NUM_DRONES > 1:
+            self._process_step_updates_multi()
+            return
+        platform_hit, _ = self._check_collision()
+        self._platform_hit = platform_hit
+        self._family_post_step_update()
+        self._update_min_clearance()
+        self._apply_distance_cull()
+
+    def _family_post_step_update(self) -> None:
+        self.family_runtime.post_step_update(self)
+
+    def _legacy_sar_runtime(self):
+        return self.family_runtime
+
+    def _sar_drone_state(self):
+        return self._legacy_sar_runtime().legacy_sar_drone_state(self)
+
+    def _sar_check_predicate(self) -> bool:
+        return self._legacy_sar_runtime().legacy_sar_check_predicate(self)
+
+    def _sar_step_update(self) -> None:
+        self._legacy_sar_runtime().legacy_sar_step_update(self)
+
+    def _reset_action_buffer(self) -> None:
+        """Zero the action history so reset observations do not leak prior episodes."""
+        action_dim = int(self.action_space.shape[-1])
+        self.action_buffer.clear()
+        for _ in range(self.ACTION_BUFFER_SIZE):
+            self.action_buffer.append(
+                np.zeros((self.NUM_DRONES, action_dim), dtype=np.float32)
+            )
+
+    # -------- reward ----------------------------------------------------- #
+    def _computeReward(self) -> float:
+        """Compute incremental reward based on current state."""
+        if self.NUM_DRONES > 1:
+            scorer = getattr(self.family_runtime, "score_swarm", None)
+            if scorer is None:
+                return 0.0
+            score = float(scorer(self.task, self._computeInfo())["final_score"])
+            reward = score - float(self._prev_score)
+            self._prev_score = score
+            return reward
+        evaluation = evaluate_rollout(
+            task=self.task,
+            success=self._success,
+            t=(self._t_to_goal if self._success else self._time_alive),
+            horizon=self.EP_LEN_SEC,
+            min_clearance=self._min_clearance_episode,
+            collision=self._collision,
+            failure_reason=getattr(self, "_failure_reason", "NONE"),
+        )
+
+        reward = self.family_runtime.compute_training_reward(
+            env=self,
+            evaluation=evaluation,
+            previous_score=float(self._prev_score),
+        )
+        self._prev_score = float(evaluation.score)
+        return float(reward)
+
+    # -------- termination ------------------------------------------------ #
+    def _computeTerminated(self) -> bool:
+        """Return True if episode ended via collision or goal reached."""
+        if self.family_runtime.compute_terminated(self):
+            return True
+        if self.NUM_DRONES > 1:
+            return bool(np.all(self._frozen))
+        return self._collision or self._success
+
+    # -------- truncation (timeout / safety) ------------------------------ #
+    def _computeTruncated(self) -> bool:
+        """Early termination through the active family runtime."""
+        from swarm.protocol import FailureReason
+
+        if self.NUM_DRONES > 1:
+            if self._time_alive >= self.EP_LEN_SEC:
+                for i in range(self.NUM_DRONES):
+                    if not self._frozen[i] and self._d_failure_reason[i] == FailureReason.NONE.value:
+                        self._d_failure_reason[i] = FailureReason.TIMEOUT.value
+                return True
+            return False
+
+        terminal_already = (
+            self._collision
+            or self._success
+            or self._failure_reason != FailureReason.NONE.value
+        )
+
+        state = self._getDroneStateVector(0)
+        roll, pitch = state[7], state[8]
+        return self.family_runtime.compute_truncated(
+            self,
+            terminal_already=terminal_already,
+            roll=float(roll),
+            pitch=float(pitch),
+        )
+
+    # -------- extra logging --------------------------------------------- #
+    def _computeInfo(self):
+        if self.NUM_DRONES > 1:
+            info = {
+                "num_drones": int(self.NUM_DRONES),
+                "score": self._prev_score,
+                "success": bool(np.all(self._d_success)),
+                "per_drone_success": [bool(x) for x in self._d_success],
+                "per_drone_collision": [bool(x) for x in self._d_collision],
+                "per_drone_t_to_goal": list(self._d_t_to_goal),
+                "per_drone_min_clearance": [float(x) for x in self._d_min_clearance],
+                "per_drone_failure_reason": list(self._d_failure_reason),
+            }
+            info.update(self.family_runtime.build_info(self))
+            return info
+        state = self._getDroneStateVector(0)
+        dist  = float(np.linalg.norm(state[0:3] - self.GOAL_POS))
+        info = {
+            "distance_to_goal"    : dist,
+            "score"               : self._prev_score,
+            "success"             : self._success,
+            "collision"           : self._collision,
+            "t_to_goal"           : self._t_to_goal,
+            "min_clearance"       : self._min_clearance_episode,
+            "failure_reason"      : getattr(self, "_failure_reason", "NONE"),
+        }
+        info.update(self.family_runtime.build_info(self))
+        return info
+
+    # -------- observation extension -------------------------------------- #
+    def _compute_obs_multi(self):
+        """Batched per-drone observation for a swarm (depth + state stacked on axis 0)."""
+        depths = []
+        state_vecs = []
+        batch_deps = None
+        if (
+            self._use_batch_depth
+            and self.OBS_TYPE == ObservationType.RGB
+            and self.IMG_RES is not None
+        ):
+            views = [self._drone_camera_view(i) for i in range(self.NUM_DRONES)]
+            batch_deps = p.getDepthImagesBatch(
+                width=int(self.IMG_RES[0]),
+                height=int(self.IMG_RES[1]),
+                viewMatrices=views,
+                projectionMatrix=self._drone_proj_matrix(),
+                lightDirection=self._light_direction,
+                flags=self._render_flags,
+                physicsClientId=getattr(self, "CLIENT", 0),
+            )
+        depth_stack = np.empty(
+            (self.NUM_DRONES, int(self.IMG_RES[1]), int(self.IMG_RES[0]), 1), dtype=np.float32
+        )
+        for i in range(self.NUM_DRONES):
+            if batch_deps is not None:
+                depth_raw = batch_deps[i]
+            else:
+                _, depth_raw, _ = self._getDroneImages(i)
+            if depth_raw is None:
+                depth_raw = np.ones((int(self.IMG_RES[1]), int(self.IMG_RES[0])), dtype=np.float32)
+            if self.RECORD or self.GUI:
+                self.dep[i] = depth_raw
+            self._process_depth(depth_raw, out=depth_stack[i, :, :, 0])
+            depths.append(depth_stack[i])
+            state_vecs.append(self._getDroneStateVector(i))
+        team_states = np.concatenate(
+            [np.asarray(self.pos, dtype=np.float32), np.asarray(self.vel, dtype=np.float32)],
+            axis=1,
+        )
+        stacked = {"depth": depth_stack}
+        if getattr(self, "_sar_rgb_enabled", False) and "rgb" in self._obs_layout:
+            stacked["rgb"] = self._rgb_buffer
+        return assemble_batch(
+            self._obs_layout, self, state_vecs, depths, team_states,
+            stacked_overrides=stacked,
+        )
+
+    def _computeObs(self):
+        """Build the observation declared by this challenge's input contract."""
+        if self.NUM_DRONES > 1:
+            return self._compute_obs_multi()
+
+        if getattr(self, "_office_rc_enabled", False):
+            # The rgb channel pulls its frame from the env's held-frame stream.
+            state_vec = self._getDroneStateVector(0)
+            return assemble(self._obs_layout, self, state_vec, {})
+
+        _, depth_raw, _ = self._getDroneImages(0)
+
+        if depth_raw is None:
+            return {
+                key: np.zeros(space.shape, dtype=np.float32)
+                for key, space in self.observation_space.spaces.items()
+            }
+
+        if self.RECORD or self.GUI:
+            self.dep[0] = depth_raw
+        state_vec = self._getDroneStateVector(0)
+        depth = self._process_depth(depth_raw)
+        return assemble(self._obs_layout, self, state_vec, {"depth": depth})
+
+    def _office_rgb_frame(self) -> np.ndarray:
+        """The office camera stream: a fresh frame at the stream cadence (the real
+        Tello video runs 30 fps against 50 Hz control), held between captures like
+        a real video feed. Fresh frames get the contract's imperfection layer —
+        the episode's brightness plus sensor noise keyed by the capture index, so
+        recomputing any step yields identical bytes."""
+        step_index = int(self.step_counter) // int(self.PYB_STEPS_PER_CTRL)
+        capture = step_index // OFFICE_RGB_PERIOD_STEPS
+        if getattr(self, "_office_rgb_capture", None) == capture:
+            return self._office_rgb_last
+        rgb_raw, _, _ = self._getDroneImages(0)
+        rgb = rgb_raw[:, :, :3].astype(np.float32) / 255.0
+        rgb *= self._office_rgb_bright
+        noise_rng = np.random.default_rng(
+            (int(self.task.map_seed) ^ OFFICE_APPEARANCE_SEED_OFFSET, capture)
+        )
+        rgb += noise_rng.standard_normal(rgb.shape, dtype=np.float32) * OFFICE_RGB_NOISE_STD
+        np.clip(rgb, 0.0, 1.0, out=rgb)
+        self._office_rgb_last = rgb
+        self._office_rgb_capture = capture
+        return rgb
+
+    # -------- on-demand RGB (SAR families) ------------------------------- #
+    def _render_onboard_rgb(self, nth_drone: int) -> np.ndarray:
+        """Render the drone's forward RGB frame from the same camera as the depth obs,
+        normalized to [0, 1]. Deterministic: TINY_RENDERER + the env's seeded light."""
+        cli = getattr(self, "CLIENT", 0)
+        res = int(SAR_RGB_RES)
+        drone_pos = self.pos[nth_drone, :]
+        rot_mat = np.array(p.getMatrixFromQuaternion(self.quat[nth_drone, :])).reshape(3, 3)
+        forward = rot_mat @ np.array([1.0, 0.0, 0.0])
+        forward = forward / np.linalg.norm(forward)
+        up = rot_mat @ np.array([0.0, 0.0, 1.0])
+        camera_pos = drone_pos + forward * CAMERA_EYE_FWD_M + up * CAMERA_EYE_UP_M
+        target = camera_pos + forward * 20.0
+        view = p.computeViewMatrix(
+            cameraEyePosition=camera_pos,
+            cameraTargetPosition=target,
+            cameraUpVector=up.tolist(),
+            physicsClientId=cli,
+        )
+        proj = p.computeProjectionMatrixFOV(
+            fov=self._fov, aspect=1.0, nearVal=0.05,
+            farVal=getattr(self, "_depth_far_m", DEPTH_FAR), physicsClientId=cli,
+        )
+        sun_kwargs = sun_render_kwargs(self._sun) if self._sun is not None else {}
+        _w, _h, rgb, _dep, _seg = p.getCameraImage(
+            width=res, height=res, shadow=0, renderer=p.ER_TINY_RENDERER,
+            viewMatrix=view, projectionMatrix=proj, lightDirection=self._light_direction,
+            flags=p.ER_NO_SEGMENTATION_MASK, physicsClientId=cli, **sun_kwargs,
+            **self._sky_kwargs(),
+        )
+        return np.reshape(rgb, (res, res, 4))[:, :, :3].astype(np.float32) / 255.0
+
+    def _update_rgb_requests(self, action) -> None:
+        """Serve the on-demand RGB for this step: zero every drone's slot, then render a frame
+        only for drones whose 6th action value asked (> 0.5) and that are under their per-episode
+        budget. Leaves obs["rgb"] zero-filled otherwise so the slot is always present."""
+        if not getattr(self, "_sar_rgb_enabled", False):
+            return
+        if self._rgb_dirty:
+            self._rgb_buffer.fill(0.0)
+            self._rgb_dirty = False
+        act = np.asarray(action, dtype=np.float32)
+        if act.ndim == 1:
+            act = act[None, :]
+        if act.shape[-1] <= 5:
+            return
+        for i in range(self.NUM_DRONES):
+            if self.NUM_DRONES > 1 and self._frozen[i]:
+                continue
+            if float(act[i, 5]) > 0.5 and int(self._rgb_request_count[i]) < SAR_RGB_REQUEST_CAP:
+                self._rgb_request_count[i] += 1
+                self._rgb_buffer[i] = self._render_onboard_rgb(i)
+                self._rgb_dirty = True

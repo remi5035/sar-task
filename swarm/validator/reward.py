@@ -1,0 +1,339 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# swarm/validator/reward.py
+"""Reward function for flight missions.
+
+The score is a weighted combination of mission success, time efficiency, and safety::
+
+    score = 0.45 * success_term + 0.45 * time_term + 0.10 * safety_term
+
+where
+
+* ``success_term`` is ``1`` if the mission reaches its goal and ``0``
+  otherwise.
+* ``time_term`` is based on minimum theoretical time with 6% buffer.
+* ``safety_term`` is based on minimum obstacle clearance during flight.
+
+All weights sum to one. The final score is clamped to ``[0, 1]``.
+"""
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING, Optional
+
+import numpy as np
+
+from swarm.protocol import FailureReason
+
+if TYPE_CHECKING:
+    from swarm.protocol import MapTask
+
+from swarm.constants import (
+    HOVER_SEC,
+    INTERCEPTOR_ACQUIRE_SLACK_SEC,
+    INTERCEPTOR_MINER_SPEED,
+    INTERCEPTOR_TARGET_FLEE_FRAC,
+    INTERCEPTOR_TIME_BUFFER,
+    REWARD_W_SAFETY,
+    REWARD_W_SUCCESS,
+    REWARD_W_TIME,
+    SAFETY_DISTANCE_DANGER,
+    SAFETY_DISTANCE_SAFE,
+    SAFETY_DISTANCE_SAFE_BY_TYPE,
+    SAR_DWELL_SEC,
+    SAR_SEARCH_RADIUS,
+    SAR_SWEEP_WIDTH,
+    SAR_TIME_TERM_BUFFER,
+    SEARCH_DETECT_WIDTH,
+    SEARCH_LAND_SEC,
+    SEARCH_SWEEP_ALPHA,
+    SEARCH_TIME_BUFFER,
+    SPEED_LIMIT,
+    SWARM_CONGESTION_PER_NEIGHBOR_SEC,
+)
+
+__all__ = [
+    "PARTICIPATION_REASONS",
+    "PARTICIPATION_REWARD",
+    "_calculate_interceptor_target_time",
+    "_calculate_safety_term",
+    "_calculate_sar_target_time",
+    "_calculate_swarm_sar_target_time",
+    "_calculate_swarm_target_time",
+    "_calculate_target_time",
+    "_clamp",
+    "_score_single_drone",
+    "calculate_time_term",
+    "flight_reward",
+]
+
+
+PARTICIPATION_REASONS = frozenset({
+    "OBSTACLE_COLLISION",
+    "NO_TOUCH_SPHERE",
+    "INFEASIBLE",
+    "SPAWN_FAILURE",
+    "TILT",
+    "TIMEOUT",
+})
+PARTICIPATION_REWARD = 0.01
+
+
+def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    """Clamp *value* to the inclusive range [*lower*, *upper*]."""
+    return max(lower, min(upper, value))
+
+
+def _search_sweep_time(search_radius: float) -> float:
+    """Time to sweep a disk of ``search_radius`` to locate the pad (area / coverage rate)."""
+    r = max(0.0, float(search_radius))
+    return SEARCH_SWEEP_ALPHA * math.pi * r * r / max(SEARCH_DETECT_WIDTH * SPEED_LIMIT, 1e-6)
+
+
+def _calculate_target_time(task: "MapTask") -> float:
+    """Target time = travel to the goal + sweeping the GPS search disk + a moment to land.
+
+    The drone is told only a noisy search centre (goal +/- ``search_radius``) and must
+    search to find the pad, so the time budget includes the expected sweep. Without it a
+    wider search area would make a perfect time term impossible.
+    """
+    start_pos = np.array(task.start)
+    goal_pos = np.array(task.goal)
+    distance = float(np.linalg.norm(goal_pos - start_pos))
+    search_radius = float(getattr(task, "search_radius", 0.0) or 0.0)
+
+    travel = (distance / SPEED_LIMIT) + HOVER_SEC
+    return SEARCH_TIME_BUFFER * (travel + _search_sweep_time(search_radius) + SEARCH_LAND_SEC)
+
+
+def _calculate_sar_target_time(task: "MapTask") -> float:
+    """Candidate-C SAR target time: travel + sweep + dwell, with buffer."""
+    sc = getattr(task, "search_centre", None)
+    if sc is None:
+        sc = (0.0, 0.0)
+    sx, sy = float(task.start[0]), float(task.start[1])
+    d = math.hypot(sx - float(sc[0]), sy - float(sc[1]))
+    sweep = 0.70 * math.pi * (SAR_SEARCH_RADIUS ** 2) / max(
+        SAR_SWEEP_WIDTH * SPEED_LIMIT, 1e-6
+    )
+    target = SAR_TIME_TERM_BUFFER * (
+        d / max(SPEED_LIMIT, 1e-6) + sweep + SAR_DWELL_SEC
+    )
+    # Keep the target inside the horizon so the time term always discriminates.
+    return min(target, float(task.horizon) * 0.95)
+
+
+def _calculate_safety_term(
+    min_clearance: float, collision: bool, challenge_type: int = 0
+) -> float:
+    """Calculate safety term based on minimum obstacle clearance."""
+    if collision:
+        return 0.0
+    safe = SAFETY_DISTANCE_SAFE_BY_TYPE.get(challenge_type, SAFETY_DISTANCE_SAFE)
+    if min_clearance >= safe:
+        return 1.0
+    if min_clearance <= SAFETY_DISTANCE_DANGER:
+        return 0.0
+    return (min_clearance - SAFETY_DISTANCE_DANGER) / (safe - SAFETY_DISTANCE_DANGER)
+
+
+def calculate_time_term(
+    *,
+    t: float,
+    horizon: float,
+    target_time: Optional[float],
+) -> float:
+    """Calculate a normalized time-efficiency term in ``[0, 1]``."""
+    if target_time is None:
+        return _clamp(1.0 - t / horizon)
+    if t <= target_time:
+        return 1.0
+    if horizon <= target_time:
+        return 0.0
+    return _clamp(1.0 - (t - target_time) / (horizon - target_time))
+
+
+def _calculate_swarm_sar_target_time(starts, search_centre, n_drones: int, search_radius: float) -> float:
+    """Team SAR target time: travel from the start cluster to the clue, plus the
+    area sweep divided across the swarm, plus the dwell. Dividing the sweep by the
+    drone count means more drones are expected to find the victim faster."""
+    pts = [np.asarray(s, dtype=float) for s in starts] or [np.zeros(2)]
+    cx = float(np.mean([p[0] for p in pts]))
+    cy = float(np.mean([p[1] for p in pts]))
+    sc = search_centre if search_centre is not None else (0.0, 0.0)
+    d = math.hypot(cx - float(sc[0]), cy - float(sc[1]))
+    sweep = 0.70 * math.pi * (float(search_radius) ** 2) / max(SAR_SWEEP_WIDTH * SPEED_LIMIT, 1e-6)
+    return SAR_TIME_TERM_BUFFER * (
+        d / max(SPEED_LIMIT, 1e-6) + sweep / max(int(n_drones), 1) + SAR_DWELL_SEC
+    )
+
+
+def _calculate_interceptor_target_time(task: "MapTask") -> float:
+    """Par time to intercept: travel to close the live start->target gap at the chaser's
+    net closing speed, plus a fixed slack for visually acquiring the target."""
+    speed = float(INTERCEPTOR_MINER_SPEED)
+    flee = float(INTERCEPTOR_TARGET_FLEE_FRAC)
+    if speed <= 0.0:
+        raise ValueError("INTERCEPTOR_MINER_SPEED must be positive")
+    if not (0.0 <= flee < 1.0):
+        raise ValueError("INTERCEPTOR_TARGET_FLEE_FRAC must be in [0, 1)")
+    gap = float(np.linalg.norm(np.asarray(task.goal, dtype=float) - np.asarray(task.start, dtype=float)))
+    closing = speed * (1.0 - flee * 0.5)  # effective rate: the target cruises until the chaser closes
+    par = INTERCEPTOR_TIME_BUFFER * (gap / max(closing, 1e-6) + INTERCEPTOR_ACQUIRE_SLACK_SEC)
+    return min(par, float(task.horizon) * 0.95)
+
+
+def _calculate_office_target_time(task) -> float:
+    """Par time for the office interceptor: cross the spawn gap at the RC speed
+    cap plus a fixed slack for locating the target, capped under the horizon.
+    A seed whose target flees closes slower, so its par stretches to match."""
+    from swarm.challenge_families.office_interceptor import (
+        office_airframe_profile,
+        office_target_profile,
+    )
+    from swarm.constants import OFFICE_ACQUIRE_SLACK_SEC, OFFICE_RC_SPEED
+
+    profile = office_target_profile(int(task.map_seed))
+    evasive = profile["flee_frac"] if profile["react_range"] > 0.0 else 0.0
+    # Par follows the airframe this episode actually deals, so a slow draw is not
+    # scored against a fast drone's clock. The flee allowance stays the target's own:
+    # it runs at a fraction of the nominal speed whatever the chaser was dealt.
+    chaser = office_airframe_profile(int(task.map_seed))["speed"]
+    closing = max(0.1, chaser - 0.5 * evasive * OFFICE_RC_SPEED)
+    sx, sy, _ = task.start
+    gx, gy, _ = task.goal
+    gap = math.hypot(gx - sx, gy - sy)
+    par = gap / closing + OFFICE_ACQUIRE_SLACK_SEC
+    return min(par, 0.95 * float(task.horizon))
+
+
+def _calculate_swarm_target_time(start, goal, n_congested: int) -> float:
+    """Straight-line autopilot target time plus a per-neighbour congestion slack
+    so a drone that detours to deconflict is not punished as merely slow."""
+    distance = float(np.linalg.norm(np.asarray(goal, dtype=float) - np.asarray(start, dtype=float)))
+    base = (distance / SPEED_LIMIT) + HOVER_SEC
+    return base * 1.06 + SWARM_CONGESTION_PER_NEIGHBOR_SEC * int(n_congested)
+
+
+def _score_single_drone(
+    *,
+    success: bool,
+    t: float,
+    horizon: float,
+    target_time: Optional[float],
+    min_clearance: Optional[float],
+    collision: bool,
+    challenge_type: int,
+    failure_reason: str,
+) -> float:
+    """Per-drone autopilot score (0.45 success + 0.45 time + 0.10 safety).
+
+    Numerically identical to AutopilotChallengeFamily.normalize_rollout_metrics
+    for one drone; the swarm family averages this over its drones.
+    """
+    if failure_reason == FailureReason.EVAL_ERROR.value:
+        return 0.0
+    if not success:
+        return PARTICIPATION_REWARD if t > 0.0 else 0.0
+    if collision:
+        return PARTICIPATION_REWARD if t > 0.0 else 0.0
+
+    time_term = calculate_time_term(t=t, horizon=horizon, target_time=target_time)
+    if min_clearance is not None:
+        safety_term = _calculate_safety_term(float(min_clearance), collision=False, challenge_type=challenge_type)
+    else:
+        safety_term = 1.0
+    return _clamp((0.45 * 1.0) + (0.45 * time_term) + (0.10 * safety_term))
+
+
+def flight_reward(
+    success: bool,
+    t: float,
+    horizon: float,
+    task: Optional["MapTask"] = None,
+    *,
+    min_clearance: Optional[float] = None,
+    collision: bool = False,
+    w_success: float = REWARD_W_SUCCESS,
+    w_t: float = REWARD_W_TIME,
+    w_safety: float = REWARD_W_SAFETY,
+    failure_reason: str = "NONE",
+    sar_mode: bool = False,
+) -> float:
+    """Compute the reward for a single flight mission.
+
+    Parameters
+    ----------
+    success
+        ``True`` if the mission successfully reached its objective.
+    t
+        Time (in seconds) taken to complete the mission.
+    horizon
+        Maximum time allowed to complete the mission.
+    task
+        MapTask object containing start and goal positions for distance calculation.
+    min_clearance
+        Minimum distance (meters) to any obstacle during flight. If None, safety
+        term is set to 1.0 (full score).
+    collision
+        ``True`` if the drone collided with an obstacle. Forces safety term to 0.
+    w_success, w_t, w_safety
+        Weights for success, time, and safety terms. They should sum to ``1``.
+    Returns
+    -------
+    float
+        A score in the range ``[0, 1]``.
+    """
+
+    if horizon <= 0:
+        raise ValueError("'horizon' must be positive")
+
+    if failure_reason == FailureReason.EVAL_ERROR.value:
+        return 0.0
+
+    if not success:
+        if failure_reason in PARTICIPATION_REASONS:
+            return PARTICIPATION_REWARD
+        if not sar_mode and t > 0.0:
+            return PARTICIPATION_REWARD
+        return 0.0
+
+    if collision:
+        if t > 0.0:
+            return PARTICIPATION_REWARD
+        return 0.0
+
+    success_term = 1.0
+
+    target_time = None
+    if task is not None:
+        target_time = (
+            _calculate_sar_target_time(task)
+            if sar_mode
+            else _calculate_target_time(task)
+        )
+    time_term = calculate_time_term(t=t, horizon=horizon, target_time=target_time)
+
+    challenge_type = getattr(task, "challenge_type", 0) if task is not None else 0
+    if min_clearance is not None:
+        safety_term = _calculate_safety_term(min_clearance, collision, challenge_type)
+    else:
+        safety_term = 1.0 if not collision else 0.0
+
+    score = (w_success * success_term) + (w_t * time_term) + (w_safety * safety_term)
+    return _clamp(score)

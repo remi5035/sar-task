@@ -1,0 +1,1218 @@
+{
+  "schema_version": "2026-05-25",
+  "entity_types": {
+    "challenge_family": {
+      "description": "Top-level challenge family that owns rules, scoring, emissions, and supported environments.",
+      "id_prefix": "cf_",
+      "ids": [
+        "cf_autopilot",
+        "cf_interceptor",
+        "cf_interceptor_office",
+        "cf_search_and_rescue",
+        "cf_swarm_autopilot",
+        "cf_swarm_sar"
+      ]
+    },
+    "challenge_instance": {
+      "description": "Single generated evaluation unit inside a challenge family.",
+      "id_prefix": "ci_",
+      "id_template": "ci_<challenge_family_slug>_<environment_type>_<benchmark_version>_<seed>",
+      "required_dimensions": [
+        "challenge_family",
+        "environment_type",
+        "benchmark_version",
+        "seed"
+      ]
+    },
+    "skill": {
+      "description": "Capability measured by a challenge family.",
+      "id_prefix": "sk_",
+      "ids": [
+        "sk_autonomous_navigation",
+        "sk_search_and_rescue"
+      ]
+    },
+    "market_vertical": {
+      "description": "Deployment market represented by a challenge family.",
+      "id_prefix": "mv_",
+      "ids": [
+        "mv_general_autonomy",
+        "mv_public_safety"
+      ]
+    }
+  },
+  "enum_types": {
+    "family_state": [
+      "incubating",
+      "active",
+      "completed",
+      "archived"
+    ],
+    "emissions_state": [
+      "incubating",
+      "active",
+      "saturated",
+      "archived",
+      "regression"
+    ],
+    "visibility": [
+      "public",
+      "private"
+    ],
+    "environment_type": [
+      "city",
+      "open",
+      "mountain",
+      "village",
+      "warehouse",
+      "forest",
+      "office"
+    ]
+  },
+  "skills": {
+    "sk_autonomous_navigation": {
+      "skill_id": "sk_autonomous_navigation",
+      "name": "Autonomous Navigation",
+      "description": "Navigate safely and efficiently toward mission goals in changing environments.",
+      "display": {
+        "label": "Autonomous Navigation",
+        "short_label": "Navigation",
+        "slug": "autonomous-navigation"
+      }
+    },
+    "sk_search_and_rescue": {
+      "skill_id": "sk_search_and_rescue",
+      "name": "Search and Rescue",
+      "description": "Search an area under uncertainty, prioritize likely targets, and complete rescue-oriented missions.",
+      "display": {
+        "label": "Search and Rescue",
+        "short_label": "SAR",
+        "slug": "search-and-rescue"
+      }
+    }
+  },
+  "market_verticals": {
+    "mv_general_autonomy": {
+      "market_vertical_id": "mv_general_autonomy",
+      "name": "General Autonomy",
+      "description": "Cross-cutting autonomy capabilities that transfer across multiple drone missions.",
+      "display": {
+        "label": "General Autonomy",
+        "short_label": "Autonomy",
+        "slug": "general-autonomy"
+      }
+    },
+    "mv_public_safety": {
+      "market_vertical_id": "mv_public_safety",
+      "name": "Public Safety",
+      "description": "Emergency-response, first-responder, and civic-protection missions.",
+      "display": {
+        "label": "Public Safety",
+        "short_label": "Public Safety",
+        "slug": "public-safety"
+      }
+    }
+  },
+  "score_schemas": {
+    "ss_navigation_v1": {
+      "score_schema_id": "ss_navigation_v1",
+      "name": "Navigation Benchmark Score",
+      "description": "Normalized navigation benchmark for safe, efficient waypoint completion.",
+      "normalized_score_range": [
+        0,
+        1
+      ],
+      "primary_metric": "mission_score",
+      "metrics": [
+        {
+          "metric_id": "mission_score",
+          "label": "Mission Score",
+          "kind": "normalized",
+          "objective": "maximize",
+          "unit": "score"
+        },
+        {
+          "metric_id": "collision_free_rate",
+          "label": "Collision-Free Rate",
+          "kind": "ratio",
+          "objective": "maximize",
+          "unit": "ratio"
+        },
+        {
+          "metric_id": "path_efficiency",
+          "label": "Path Efficiency",
+          "kind": "normalized",
+          "objective": "maximize",
+          "unit": "score"
+        },
+        {
+          "metric_id": "control_smoothness",
+          "label": "Control Smoothness",
+          "kind": "normalized",
+          "objective": "maximize",
+          "unit": "score"
+        }
+      ]
+    },
+    "ss_search_and_rescue_v1": {
+      "score_schema_id": "ss_search_and_rescue_v1",
+      "name": "Search and Rescue Benchmark Score",
+      "description": "Normalized mission score for search coverage, target discovery, and safe completion under uncertainty.",
+      "normalized_score_range": [
+        0,
+        1
+      ],
+      "primary_metric": "mission_score",
+      "metrics": [
+        {
+          "metric_id": "mission_score",
+          "label": "Mission Score",
+          "kind": "normalized",
+          "objective": "maximize",
+          "unit": "score"
+        },
+        {
+          "metric_id": "target_discovery_rate",
+          "label": "Target Discovery Rate",
+          "kind": "ratio",
+          "objective": "maximize",
+          "unit": "ratio"
+        },
+        {
+          "metric_id": "area_coverage",
+          "label": "Area Coverage",
+          "kind": "ratio",
+          "objective": "maximize",
+          "unit": "ratio"
+        },
+        {
+          "metric_id": "navigation_safety",
+          "label": "Navigation Safety",
+          "kind": "normalized",
+          "objective": "maximize",
+          "unit": "score"
+        }
+      ]
+    }
+  },
+  "challenge_families": {
+    "cf_autopilot": {
+      "family_id": "cf_autopilot",
+      "name": "Autopilot / Navigation",
+      "description": "Baseline family for safe goal-directed navigation, obstacle avoidance, and control quality.",
+      "display": {
+        "label": "Autopilot / Navigation",
+        "short_label": "Autopilot",
+        "slug": "autopilot"
+      },
+      "family_state": "active",
+      "emissions_state": "active",
+      "visibility": "private",
+      "skill_ids": [
+        "sk_autonomous_navigation"
+      ],
+      "market_vertical_ids": [
+        "mv_general_autonomy"
+      ],
+      "environment_types": [
+        "city",
+        "open",
+        "mountain",
+        "village",
+        "warehouse",
+        "forest"
+      ],
+      "score_schema_id": "ss_navigation_v1",
+      "supported_interface_versions": [
+        "submission_zip.v1"
+      ],
+      "screening_policy": {
+        "bootstrap_threshold": 0.01,
+        "min_improvement": 0.015,
+        "early_fail_checkpoints": {
+          "50": 0.5,
+          "100": 0.7,
+          "150": 0.85
+        },
+        "min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "benchmark_admission_policy": {
+        "champion_min_improvement": 0.015,
+        "champion_min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "emission_allocation": 0.15
+    },
+    "cf_search_and_rescue": {
+      "family_id": "cf_search_and_rescue",
+      "name": "Search and Rescue",
+      "description": "Mission family for uncertain-area search, target discovery, coverage optimization, and rescue-oriented planning.",
+      "display": {
+        "label": "Search and Rescue",
+        "short_label": "SAR",
+        "slug": "search-and-rescue"
+      },
+      "family_state": "active",
+      "emissions_state": "active",
+      "visibility": "private",
+      "skill_ids": [
+        "sk_autonomous_navigation",
+        "sk_search_and_rescue"
+      ],
+      "market_vertical_ids": [
+        "mv_public_safety"
+      ],
+      "environment_types": [
+        "city",
+        "open",
+        "mountain",
+        "village",
+        "warehouse",
+        "forest"
+      ],
+      "score_schema_id": "ss_search_and_rescue_v1",
+      "supported_interface_versions": [
+        "submission_zip.v1"
+      ],
+      "screening_policy": {
+        "bootstrap_threshold": 0.01,
+        "min_improvement": 0.015,
+        "early_fail_checkpoints": {
+          "50": 0.45,
+          "100": 0.65,
+          "150": 0.8
+        },
+        "min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "benchmark_admission_policy": {
+        "champion_min_improvement": 0.015,
+        "champion_min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "emission_allocation": 0.15
+    },
+    "cf_swarm_autopilot": {
+      "family_id": "cf_swarm_autopilot",
+      "name": "Swarm Autopilot",
+      "description": "A swarm of 2-8 drones flown by one centralized policy that land on a shared pool of platforms while avoiding each other.",
+      "display": {
+        "label": "Swarm Autopilot",
+        "short_label": "Swarm",
+        "slug": "swarm-autopilot"
+      },
+      "family_state": "active",
+      "emissions_state": "active",
+      "visibility": "private",
+      "skill_ids": [
+        "sk_autonomous_navigation"
+      ],
+      "market_vertical_ids": [
+        "mv_general_autonomy"
+      ],
+      "environment_types": [
+        "city",
+        "open",
+        "mountain",
+        "village",
+        "forest"
+      ],
+      "score_schema_id": "ss_navigation_v1",
+      "supported_interface_versions": [
+        "submission_zip.v1"
+      ],
+      "screening_policy": {
+        "bootstrap_threshold": 0.01,
+        "min_improvement": 0.015,
+        "early_fail_checkpoints": {
+          "50": 0.5,
+          "100": 0.7,
+          "150": 0.85
+        },
+        "min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "benchmark_admission_policy": {
+        "champion_min_improvement": 0.015,
+        "champion_min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "emission_allocation": 0.2
+    },
+    "cf_swarm_sar": {
+      "family_id": "cf_swarm_sar",
+      "name": "Swarm Search and Rescue",
+      "description": "A swarm of 2-8 drones flown by one centralized policy, all searching for one shared victim over a much bigger search area.",
+      "display": {
+        "label": "Swarm Search and Rescue",
+        "short_label": "Swarm SAR",
+        "slug": "swarm-search-and-rescue"
+      },
+      "family_state": "active",
+      "emissions_state": "active",
+      "visibility": "private",
+      "skill_ids": [
+        "sk_autonomous_navigation",
+        "sk_search_and_rescue"
+      ],
+      "market_vertical_ids": [
+        "mv_public_safety"
+      ],
+      "environment_types": [
+        "city",
+        "open",
+        "mountain",
+        "village",
+        "forest"
+      ],
+      "score_schema_id": "ss_search_and_rescue_v1",
+      "supported_interface_versions": [
+        "submission_zip.v1"
+      ],
+      "screening_policy": {
+        "bootstrap_threshold": 0.01,
+        "min_improvement": 0.015,
+        "early_fail_checkpoints": {
+          "50": 0.45,
+          "100": 0.65,
+          "150": 0.8
+        },
+        "min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "benchmark_admission_policy": {
+        "champion_min_improvement": 0.015,
+        "champion_min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "emission_allocation": 0.2
+    },
+    "cf_interceptor": {
+      "family_id": "cf_interceptor",
+      "name": "Interceptor",
+      "description": "Air-to-air pursuit: the miner's drone takes off, flies to a search area, finds a validator-flown target drone with its depth camera, and intercepts it. Open map only; a 36 cm drone is used so the target is visible.",
+      "display": {
+        "label": "Interceptor",
+        "short_label": "Interceptor",
+        "slug": "interceptor"
+      },
+      "family_state": "completed",
+      "emissions_state": "archived",
+      "visibility": "private",
+      "skill_ids": [
+        "sk_autonomous_navigation"
+      ],
+      "market_vertical_ids": [
+        "mv_general_autonomy"
+      ],
+      "environment_types": [
+        "open"
+      ],
+      "score_schema_id": "ss_navigation_v1",
+      "supported_interface_versions": [
+        "submission_zip.v1"
+      ],
+      "screening_policy": {
+        "bootstrap_threshold": 0.01,
+        "min_improvement": 0.015,
+        "early_fail_checkpoints": {
+          "50": 0.5,
+          "100": 0.7,
+          "150": 0.85
+        },
+        "min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "benchmark_admission_policy": {
+        "champion_min_improvement": 0.015,
+        "champion_min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "emission_allocation": 0.3
+    },
+    "cf_interceptor_office": {
+      "family_id": "cf_interceptor_office",
+      "name": "Interceptor Office",
+      "description": "Indoor air-to-air pursuit: a Tello-class drone hunts a target drone inside a fixed office digital twin. Body-frame RC actions (no GPS or world-frame control), built for sim-to-real transfer to a physical Tello.",
+      "display": {
+        "label": "Interceptor Office",
+        "short_label": "Office",
+        "slug": "interceptor-office"
+      },
+      "family_state": "active",
+      "emissions_state": "active",
+      "visibility": "private",
+      "skill_ids": [
+        "sk_autonomous_navigation"
+      ],
+      "market_vertical_ids": [
+        "mv_general_autonomy"
+      ],
+      "environment_types": [
+        "office"
+      ],
+      "score_schema_id": "ss_navigation_v1",
+      "supported_interface_versions": [
+        "submission_zip.v1"
+      ],
+      "screening_policy": {
+        "bootstrap_threshold": 0.01,
+        "min_improvement": 0.015,
+        "early_fail_checkpoints": {
+          "50": 0.5,
+          "100": 0.7,
+          "150": 0.85
+        },
+        "min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "benchmark_admission_policy": {
+        "champion_min_improvement": 0.015,
+        "champion_min_improvement_floor": 0.005,
+        "improvement_plateau_end": 0.5
+      },
+      "emission_allocation": 0.3
+    }
+  },
+  "policy_interfaces": {
+    "cf_autopilot:submission_zip.v1": {
+      "family_id": "cf_autopilot",
+      "interface_version": "submission_zip.v1",
+      "contract_version": "policy_contract.v1",
+      "contract_filename": "swarm_policy_contract.json",
+      "entry_point": {
+        "module": "drone_agent",
+        "class_name": "DroneFlightController",
+        "act_method": "act",
+        "reset_method": "reset"
+      },
+      "observation_space": {
+        "type": "dict",
+        "required_keys": [
+          "depth",
+          "state"
+        ],
+        "fields": {
+          "depth": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              128,
+              128,
+              1
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "state": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic"
+            ],
+            "rank": 1,
+            "minimum_length": 16,
+            "semantic_channels": [
+              "position_xyz",
+              "orientation_rpy",
+              "linear_velocity_xyz",
+              "angular_velocity_xyz",
+              "action_history",
+              "altitude_norm",
+              "goal_offset_xyz"
+            ]
+          }
+        }
+      },
+      "observation_assembly": {
+        "depth": [
+          "depth_camera"
+        ],
+        "state": [
+          "position",
+          "orientation",
+          "linear_velocity",
+          "angular_velocity",
+          "action_history",
+          "altitude_norm",
+          "goal_offset"
+        ]
+      },
+      "action_space": {
+        "type": "tensor",
+        "dtype": "float32",
+        "shape": [
+          5
+        ],
+        "component_names": [
+          "dir_x",
+          "dir_y",
+          "dir_z",
+          "speed",
+          "yaw"
+        ],
+        "lower_bound": [
+          -1.0,
+          -1.0,
+          -1.0,
+          0.0,
+          -1.0
+        ],
+        "upper_bound": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "smoke_test_observation": {
+        "depth": {
+          "shape": [
+            128,
+            128,
+            1
+          ],
+          "fill": 0.25
+        },
+        "state": {
+          "shape": [
+            141
+          ],
+          "fill": 0.0
+        }
+      }
+    },
+    "cf_swarm_autopilot:submission_zip.v1": {
+      "family_id": "cf_swarm_autopilot",
+      "interface_version": "submission_zip.v1",
+      "num_drones_range": [
+        2,
+        8
+      ],
+      "contract_version": "policy_contract.v1",
+      "contract_filename": "swarm_policy_contract.json",
+      "entry_point": {
+        "module": "drone_agent",
+        "class_name": "DroneFlightController",
+        "act_method": "act",
+        "reset_method": "reset"
+      },
+      "observation_space": {
+        "type": "dict",
+        "required_keys": [
+          "depth",
+          "state"
+        ],
+        "fields": {
+          "depth": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic",
+              128,
+              128,
+              1
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "state": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic",
+              190
+            ],
+            "rank": 2,
+            "minimum_length": 16,
+            "semantic_channels": [
+              "position_xyz",
+              "orientation_rpy",
+              "linear_velocity_xyz",
+              "angular_velocity_xyz",
+              "action_history",
+              "altitude_norm",
+              "goal_offset_xyz",
+              "teammate_rel_state"
+            ]
+          }
+        }
+      },
+      "observation_assembly": {
+        "depth": [
+          "depth_camera"
+        ],
+        "state": [
+          "position",
+          "orientation",
+          "linear_velocity",
+          "angular_velocity",
+          "action_history",
+          "altitude_norm",
+          "goal_offset",
+          "teammate_state"
+        ]
+      },
+      "action_space": {
+        "type": "tensor",
+        "dtype": "float32",
+        "shape": [
+          "dynamic",
+          5
+        ],
+        "component_names": [
+          "dir_x",
+          "dir_y",
+          "dir_z",
+          "speed",
+          "yaw"
+        ],
+        "lower_bound": [
+          -1.0,
+          -1.0,
+          -1.0,
+          0.0,
+          -1.0
+        ],
+        "upper_bound": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "smoke_test_observation": {
+        "depth": {
+          "shape": [
+            128,
+            128,
+            1
+          ],
+          "fill": 0.25
+        },
+        "state": {
+          "shape": [
+            190
+          ],
+          "fill": 0.0
+        }
+      }
+    },
+    "cf_search_and_rescue:submission_zip.v1": {
+      "family_id": "cf_search_and_rescue",
+      "interface_version": "submission_zip.v1",
+      "contract_version": "policy_contract.v1",
+      "contract_filename": "swarm_policy_contract.json",
+      "entry_point": {
+        "module": "drone_agent",
+        "class_name": "DroneFlightController",
+        "act_method": "act",
+        "reset_method": "reset"
+      },
+      "observation_space": {
+        "type": "dict",
+        "required_keys": [
+          "depth",
+          "rgb",
+          "state"
+        ],
+        "fields": {
+          "depth": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              256,
+              256,
+              1
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "rgb": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              256,
+              256,
+              3
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "state": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic"
+            ],
+            "rank": 1,
+            "minimum_length": 16,
+            "semantic_channels": [
+              "position_xyz",
+              "orientation_rpy",
+              "linear_velocity_xyz",
+              "angular_velocity_xyz",
+              "action_history",
+              "altitude_norm",
+              "search_clue_offset_xyz"
+            ]
+          }
+        }
+      },
+      "observation_assembly": {
+        "depth": [
+          "depth_camera_md"
+        ],
+        "rgb": [
+          "rgb_camera"
+        ],
+        "state": [
+          "position",
+          "orientation",
+          "linear_velocity",
+          "angular_velocity",
+          "action_history",
+          "altitude_norm",
+          "search_clue_offset"
+        ]
+      },
+      "action_space": {
+        "type": "tensor",
+        "dtype": "float32",
+        "shape": [
+          6
+        ],
+        "component_names": [
+          "dir_x",
+          "dir_y",
+          "dir_z",
+          "speed",
+          "yaw",
+          "rgb_request"
+        ],
+        "lower_bound": [
+          -1.0,
+          -1.0,
+          -1.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "upper_bound": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "smoke_test_observation": {
+        "depth": {
+          "shape": [
+            256,
+            256,
+            1
+          ],
+          "fill": 0.25
+        },
+        "rgb": {
+          "shape": [
+            256,
+            256,
+            3
+          ],
+          "fill": 0.0
+        },
+        "state": {
+          "shape": [
+            165
+          ],
+          "fill": 0.0
+        }
+      }
+    },
+    "cf_swarm_sar:submission_zip.v1": {
+      "family_id": "cf_swarm_sar",
+      "interface_version": "submission_zip.v1",
+      "num_drones_range": [
+        2,
+        8
+      ],
+      "contract_version": "policy_contract.v1",
+      "contract_filename": "swarm_policy_contract.json",
+      "entry_point": {
+        "module": "drone_agent",
+        "class_name": "DroneFlightController",
+        "act_method": "act",
+        "reset_method": "reset"
+      },
+      "observation_space": {
+        "type": "dict",
+        "required_keys": [
+          "depth",
+          "rgb",
+          "state"
+        ],
+        "fields": {
+          "depth": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic",
+              256,
+              256,
+              1
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "rgb": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic",
+              256,
+              256,
+              3
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "state": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic",
+              214
+            ],
+            "rank": 2,
+            "minimum_length": 16,
+            "semantic_channels": [
+              "position_xyz",
+              "orientation_rpy",
+              "linear_velocity_xyz",
+              "angular_velocity_xyz",
+              "action_history",
+              "altitude_norm",
+              "search_clue_offset_xy",
+              "teammate_rel_state"
+            ]
+          }
+        }
+      },
+      "observation_assembly": {
+        "depth": [
+          "depth_camera_md"
+        ],
+        "rgb": [
+          "rgb_camera"
+        ],
+        "state": [
+          "position",
+          "orientation",
+          "linear_velocity",
+          "angular_velocity",
+          "action_history",
+          "altitude_norm",
+          "search_clue_offset",
+          "teammate_state"
+        ]
+      },
+      "action_space": {
+        "type": "tensor",
+        "dtype": "float32",
+        "shape": [
+          "dynamic",
+          6
+        ],
+        "component_names": [
+          "dir_x",
+          "dir_y",
+          "dir_z",
+          "speed",
+          "yaw",
+          "rgb_request"
+        ],
+        "lower_bound": [
+          -1.0,
+          -1.0,
+          -1.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "upper_bound": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "smoke_test_observation": {
+        "depth": {
+          "shape": [
+            256,
+            256,
+            1
+          ],
+          "fill": 0.25
+        },
+        "rgb": {
+          "shape": [
+            256,
+            256,
+            3
+          ],
+          "fill": 0.0
+        },
+        "state": {
+          "shape": [
+            214
+          ],
+          "fill": 0.0
+        }
+      }
+    },
+    "cf_interceptor:submission_zip.v1": {
+      "family_id": "cf_interceptor",
+      "interface_version": "submission_zip.v1",
+      "contract_version": "policy_contract.v1",
+      "contract_filename": "swarm_policy_contract.json",
+      "entry_point": {
+        "module": "drone_agent",
+        "class_name": "DroneFlightController",
+        "act_method": "act",
+        "reset_method": "reset"
+      },
+      "observation_space": {
+        "type": "dict",
+        "required_keys": [
+          "depth",
+          "state"
+        ],
+        "fields": {
+          "depth": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              1024,
+              1024,
+              1
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "state": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic"
+            ],
+            "rank": 1,
+            "minimum_length": 16,
+            "semantic_channels": [
+              "position_xyz",
+              "orientation_rpy",
+              "linear_velocity_xyz",
+              "angular_velocity_xyz",
+              "action_history",
+              "altitude_norm",
+              "search_clue_offset_xy"
+            ]
+          }
+        }
+      },
+      "observation_assembly": {
+        "depth": [
+          "depth_camera_hd"
+        ],
+        "state": [
+          "position",
+          "orientation",
+          "linear_velocity",
+          "angular_velocity",
+          "action_history",
+          "altitude_norm",
+          "search_clue_offset"
+        ]
+      },
+      "action_space": {
+        "type": "tensor",
+        "dtype": "float32",
+        "shape": [
+          5
+        ],
+        "component_names": [
+          "dir_x",
+          "dir_y",
+          "dir_z",
+          "speed",
+          "yaw"
+        ],
+        "lower_bound": [
+          -1.0,
+          -1.0,
+          -1.0,
+          0.0,
+          -1.0
+        ],
+        "upper_bound": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "smoke_test_observation": {
+        "depth": {
+          "shape": [
+            1024,
+            1024,
+            1
+          ],
+          "fill": 0.25
+        },
+        "state": {
+          "shape": [
+            140
+          ],
+          "fill": 0.0
+        }
+      }
+    },
+    "cf_interceptor_office:submission_zip.v1": {
+      "family_id": "cf_interceptor_office",
+      "interface_version": "submission_zip.v1",
+      "contract_version": "policy_contract.v1",
+      "contract_filename": "swarm_policy_contract.json",
+      "entry_point": {
+        "module": "drone_agent",
+        "class_name": "DroneFlightController",
+        "act_method": "act",
+        "reset_method": "reset"
+      },
+      "observation_space": {
+        "type": "dict",
+        "required_keys": [
+          "rgb",
+          "state"
+        ],
+        "fields": {
+          "rgb": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              256,
+              256,
+              3
+            ],
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "state": {
+            "type": "tensor",
+            "dtype": "float32",
+            "shape": [
+              "dynamic"
+            ],
+            "rank": 1,
+            "minimum_length": 16,
+            "semantic_channels": [
+              "attitude_pitch_roll_sincos_yaw",
+              "body_velocity_xyz",
+              "body_acceleration_xyz",
+              "altitude_tof_height_baro_age_valid",
+              "detection_n_age_boxes2x5",
+              "action_history"
+            ]
+          }
+        }
+      },
+      "observation_assembly": {
+        "rgb": [
+          "rgb_camera_office"
+        ],
+        "state": [
+          "tello_attitude",
+          "tello_velocity",
+          "tello_acceleration",
+          "tello_altitude",
+          "tello_detection",
+          "action_history"
+        ]
+      },
+      "action_space": {
+        "type": "tensor",
+        "dtype": "float32",
+        "shape": [
+          4
+        ],
+        "component_names": [
+          "lr",
+          "fb",
+          "ud",
+          "yaw"
+        ],
+        "lower_bound": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0
+        ],
+        "upper_bound": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "smoke_test_observation": {
+        "rgb": {
+          "shape": [
+            256,
+            256,
+            3
+          ],
+          "fill": 0.25
+        },
+        "state": {
+          "shape": [
+            127
+          ],
+          "fill": 0.0
+        }
+      }
+    }
+  },
+  "legacy_aliases": {
+    "challenge_type_to_environment_type": {
+      "1": "city",
+      "2": "open",
+      "3": "mountain",
+      "4": "village",
+      "5": "warehouse",
+      "6": "forest",
+      "7": "office"
+    },
+    "benchmark_group_to_environment_type": {
+      "type1_city": "city",
+      "type2_open": "open",
+      "type3_mountain": "mountain",
+      "type4_village": "village",
+      "type5_warehouse": "warehouse",
+      "type6_forest": "forest",
+      "type7_office": "office"
+    },
+    "field_renames": {
+      "challenge_type": "environment_type",
+      "map_type": "environment_type"
+    }
+  }
+}

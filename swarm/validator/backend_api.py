@@ -1,0 +1,801 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+"""
+Backend API client for the Swarm benchmark system.
+
+Validators report scores to the backend; the backend aggregates reports
+from all validators (51% stake, average) and calculates the final weights.
+This module is the HTTP client for that conversation.
+
+Endpoints used (all under /validators prefix):
+- GET  /validators/next-task            - Long-poll for the next authorized evaluation task
+- POST /validators/seed-scores          - Stream per-seed scores for the active task
+- POST /validators/tasks/{id}/result    - Submit the aggregated task result
+- GET  /validators/sync                 - Get current weights + re-eval queue + authoritative benchmark epoch
+
+The task metadata carries the phase (BENCHMARK, REEVAL, or SCREENING when the
+backend enables that pre-phase) and the seed range to run; all pass/fail
+decisions live backend-side.
+
+Freeze-last behavior:
+- If backend is down → use last known weights (saved locally)
+- Validator doesn't crash, keeps running with old weights
+
+Submission Rules:
+- Each miner hotkey can only submit ONE active model at a time
+- `EPOCH_EXPIRED` submissions free the hotkey for resubmission
+- `github_url` is required so pending models propagate across validators
+"""
+
+import asyncio
+import hashlib
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple
+
+import bittensor as bt
+import httpx
+
+from swarm import __version__ as CODE_VERSION
+from swarm.challenge_families import DEFAULT_RUNTIME_FAMILY_ID
+from swarm.config import BackendApiSettings
+from swarm.constants import (
+    BENCHMARK_VERSION,
+    DUPLICATE_SESSION_RETRY_SEC,
+    DUPLICATE_SESSION_WAIT_SEC,
+    MAX_MODEL_BYTES,
+)
+from swarm.core.submission_policy import VALIDATOR_CONTRACT
+
+STATE_DIR = Path(__file__).parent.parent.parent / "state"
+RUNTIME_STATE_FILE = STATE_DIR / "runtime_state.json"
+
+_TRANSPORT_EXCEPTIONS: Tuple[type, ...] = (
+    httpx.TransportError,
+    httpx.TimeoutException,
+)
+
+AUTHORIZE_RETRY_ATTEMPTS = 3
+AUTHORIZE_RETRY_BASE_DELAY_SEC = 2.0
+VALIDATOR_CONTRACT_VERSION = VALIDATOR_CONTRACT
+
+
+class BackendTransportError(RuntimeError):
+    """Raised when the backend cannot be reached after retries."""
+
+
+class BackendProtocolMismatchError(RuntimeError):
+    """Raised on 404/405 from /next-task or /events: backend is too old."""
+
+
+async def authorize_with_retry(
+    auth_fn: Callable[[], Awaitable[Dict[str, Any]]],
+    *,
+    attempts: int = AUTHORIZE_RETRY_ATTEMPTS,
+    base_delay: float = AUTHORIZE_RETRY_BASE_DELAY_SEC,
+    log_prefix: str = "",
+) -> Dict[str, Any]:
+    """Call an authorize function, retrying only on transport failures.
+
+    Real denials (``authorized=False`` without ``transport_failure``) and
+    unexpected responses are returned as-is after the first attempt. Transport
+    failures (``transport_failure=True``) trigger exponential backoff retries;
+    if all ``attempts`` exhaust with transport failures, ``BackendTransportError``
+    is raised so the caller can treat it as retryable rather than a cancel.
+    """
+    last: Dict[str, Any] = {}
+    for attempt in range(attempts):
+        last = await auth_fn() or {}
+        if last.get("authorized"):
+            return last
+        if not last.get("transport_failure"):
+            return last
+        if attempt == attempts - 1:
+            break
+        delay = base_delay * (2 ** attempt)
+        bt.logging.warning(
+            f"{log_prefix}authorize transport failure "
+            f"(attempt {attempt + 1}/{attempts}); retrying in {delay:.1f}s"
+        )
+        await asyncio.sleep(delay)
+    raise BackendTransportError(
+        f"{log_prefix}authorize transport failure after {attempts} attempts: "
+        f"{_scrub_url(str(last.get('error', '')))}"
+    )
+
+
+def _load_runtime_state() -> dict:
+    """Load runtime state (last known weights, re-eval queue)."""
+    try:
+        if RUNTIME_STATE_FILE.exists():
+            with open(RUNTIME_STATE_FILE, "r") as f:
+                return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        bt.logging.warning(f"Runtime state load failed: {e}")
+    return {
+        "last_weights": {},
+        "last_kings": [],
+        "reeval_queue": [],
+        "assigned_tasks": [],
+        "rollout": {},
+        "validator_compatibility": {},
+        "leaderboard_version": 0,
+        "last_sync": 0,
+        "benchmark_epoch": 0,
+    }
+
+
+def _save_runtime_state(state: dict) -> None:
+    """Save runtime state atomically."""
+    STATE_DIR.mkdir(exist_ok=True)
+    temp_file = RUNTIME_STATE_FILE.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w") as f:
+            json.dump(state, f)
+        temp_file.replace(RUNTIME_STATE_FILE)
+    except IOError as e:
+        bt.logging.error(f"Runtime state save failed: {e}")
+        temp_file.unlink(missing_ok=True)
+
+
+def _scrub_url(text: str) -> str:
+    """Strip backend URLs from log messages to prevent leaking via wandb."""
+    import re
+    return re.sub(r"https?://[^\s'\"]+", "<backend>", str(text))
+
+
+class BackendApiClient:
+    """HTTP client for backend API communication with signature authentication."""
+
+    def __init__(
+        self, wallet: "bt.wallet" = None, base_url: str = None, timeout: float = 60.0
+    ):
+        self.base_url = base_url or BackendApiSettings.from_env().base_url
+        if not self.base_url:
+            raise ValueError(
+                "SWARM_BACKEND_API_URL env var required for v4 benchmark. "
+                "Set it to your backend server URL."
+            )
+
+        self.base_url = self.base_url.rstrip("/")
+        self.timeout = timeout
+        self.wallet = wallet
+        self.session_id = uuid.uuid4().hex
+        self.client = httpx.AsyncClient(timeout=timeout)
+        self._whitelist_warned = False
+        self._upgrade_warned = False
+        self._duplicate_instance_logged = False
+        self._announcing = False
+        self._standing_down = False
+
+        self._runtime_state = _load_runtime_state()
+        bt.logging.info("BackendApiClient initialized")
+
+    @property
+    def last_sync_ts(self) -> float:
+        return self._runtime_state.get("last_sync", 0)
+
+    @property
+    def current_top(self) -> dict:
+        """Current champion summary from the last sync (uid, family_id, score, model_hash)."""
+        return self._runtime_state.get("current_top", {})
+
+    @property
+    def top_by_family(self) -> dict:
+        """Per-family champion summaries from the last sync, keyed by family_id."""
+        return self._runtime_state.get("top_by_family", {})
+
+    def get_cached_weights(self) -> dict:
+        """Advisory only; the apply path uses get_cached_kings()."""
+        return self._runtime_state.get("last_weights", {})
+
+    def get_cached_kings(self) -> list:
+        """Cached king lineage from the last successful sync."""
+        return self._runtime_state.get("last_kings", [])
+
+    async def close(self) -> None:
+        """Close HTTP client."""
+        await self.client.aclose()
+
+    def _sign_request(self, method: str, endpoint: str, body: bytes) -> Dict[str, str]:
+        """Create authentication headers with signed request."""
+        if not self.wallet:
+            bt.logging.warning("No wallet configured - requests will not be signed")
+            return {}
+
+        nonce = str(uuid.uuid4())
+        timestamp = str(int(time.time()))
+        body_hash = hashlib.sha256(body).hexdigest()
+        path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+        message = f"{timestamp}:{nonce}:{method.upper()}:{path}:{body_hash}"
+
+        signature = self.wallet.hotkey.sign(message.encode()).hex()
+
+        return {
+            "X-Validator-Hotkey": self.wallet.hotkey.ss58_address,
+            "X-Validator-Signature": signature,
+            "X-Validator-Nonce": nonce,
+            "X-Validator-Timestamp": timestamp,
+            "X-Validator-Session": self.session_id,
+            "X-Swarm-Validator-Contract": VALIDATOR_CONTRACT_VERSION,
+            "X-Code-Version": CODE_VERSION,
+        }
+
+    async def _fence_duplicate_instance(self, response: httpx.Response) -> None:
+        if response.status_code != 409:
+            return
+        try:
+            await response.aread()
+        except (AttributeError, httpx.ResponseNotRead):
+            pass
+        try:
+            payload = response.json()
+        except (ValueError, RuntimeError, httpx.ResponseNotRead):
+            return
+        if not isinstance(payload, dict) or payload.get("detail") != "DUPLICATE_VALIDATOR_INSTANCE":
+            return
+        if self._announcing:
+            # The previous life of this validator may still look alive to the
+            # backend; announce_startup keeps retrying until it decides.
+            return
+        if not self._duplicate_instance_logged:
+            bt.logging.error(
+                "Duplicate validator instance detected: another process holds this hotkey; exiting"
+            )
+            self._duplicate_instance_logged = True
+        raise SystemExit(1)
+
+    async def _post_signed(self, endpoint: str, data: dict) -> Dict[str, Any]:
+        """Make a signed POST request to the backend."""
+        body = json.dumps(data).encode()
+        headers = self._sign_request("POST", endpoint, body)
+        headers["Content-Type"] = "application/json"
+
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}{endpoint}", content=body, headers=headers
+            )
+            await self._fence_duplicate_instance(resp)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            bt.logging.warning(f"Backend rejected {endpoint}: {status}")
+            try:
+                payload: Dict[str, Any] = e.response.json()
+                if not isinstance(payload, dict):
+                    payload = {"error": _scrub_url(str(payload)), "status_code": status}
+            except Exception:
+                payload = {"error": _scrub_url(str(e)), "status_code": status}
+            # Non-2xx is a failure: guarantee an "error" key so sync never reads a rejection as success.
+            payload.setdefault("error", f"HTTP {status}")
+            payload.setdefault("status_code", status)
+            if status >= 500:
+                payload.setdefault("transport_failure", True)
+            return payload
+        except _TRANSPORT_EXCEPTIONS as e:
+            bt.logging.warning(f"Backend transport error ({endpoint}): {_scrub_url(e)}")
+            return {"error": _scrub_url(str(e)), "transport_failure": True}
+        except Exception as e:
+            bt.logging.warning(f"Backend API error ({endpoint}): {_scrub_url(e)}")
+            return {"error": _scrub_url(str(e))}
+
+    async def _get_signed(
+        self, endpoint: str, extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Make a signed GET request to the backend."""
+        body = b""
+        headers = self._sign_request("GET", endpoint, body)
+        if extra_headers:
+            headers.update(extra_headers)
+
+        try:
+            resp = await self.client.get(f"{self.base_url}{endpoint}", headers=headers)
+            await self._fence_duplicate_instance(resp)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            bt.logging.warning(f"Backend rejected {endpoint}: {status}")
+            try:
+                payload: Dict[str, Any] = e.response.json()
+                if not isinstance(payload, dict):
+                    payload = {"error": _scrub_url(str(payload)), "status_code": status}
+            except Exception:
+                payload = {"error": _scrub_url(str(e)), "status_code": status}
+            # Non-2xx is a failure: guarantee an "error" key so sync never reads a rejection as success.
+            payload.setdefault("error", f"HTTP {status}")
+            payload.setdefault("status_code", status)
+            if status >= 500:
+                payload.setdefault("transport_failure", True)
+            return payload
+        except _TRANSPORT_EXCEPTIONS as e:
+            bt.logging.warning(f"Backend transport error ({endpoint}): {_scrub_url(e)}")
+            return {"error": _scrub_url(str(e)), "transport_failure": True}
+        except Exception as e:
+            bt.logging.warning(f"Backend API error ({endpoint}): {_scrub_url(e)}")
+            return {"error": _scrub_url(str(e))}
+
+    # ──────────────────────────────────────────────────────────────────────
+    # GET /validators/sync
+    # ──────────────────────────────────────────────────────────────────────
+    async def sync(self) -> Dict[str, Any]:
+        """Get king lineage + re-eval queue. `kings` is authoritative; `weights` advisory."""
+        try:
+            data = await self._get_signed(
+                "/validators/sync",
+                extra_headers={"X-Benchmark-Version": BENCHMARK_VERSION},
+            )
+
+            if "error" not in data:
+                # Map backend response to expected format
+                current_champion = data.get("current_champion", {})
+                current_top = {}
+                if current_champion:
+                    current_top = {
+                        "uid": current_champion.get("uid"),
+                        "family_id": current_champion.get("family_id"),
+                        "score": current_champion.get("benchmark_score"),
+                        "model_hash": current_champion.get("model_hash"),
+                    }
+
+                top_by_family = {}
+                for fid, champ in (data.get("champions_by_family", {}) or {}).items():
+                    top_by_family[fid] = {
+                        "uid": champ.get("uid"),
+                        "family_id": champ.get("family_id", fid),
+                        "score": champ.get("benchmark_score"),
+                        "model_hash": champ.get("model_hash"),
+                    }
+
+                # Map reeval_queue to use uid
+                reeval_queue = []
+                for item in data.get("reeval_queue", []):
+                    reeval_queue.append(
+                        {
+                            "uid": item.get("uid"),
+                            "family_id": item.get("family_id"),
+                            "reason": item.get("reason"),
+                        }
+                    )
+
+                self._runtime_state["last_weights"] = data.get("weights", {})
+                self._runtime_state["last_kings"] = data.get("kings", [])
+                self._runtime_state["last_kings_by_family"] = data.get("kings_by_family", {})
+                self._runtime_state["last_family_shares"] = data.get("family_shares", {})
+                self._runtime_state["last_burn_extra"] = data.get("burn_extra", 0.0)
+                self._runtime_state["last_dropped_share"] = data.get("dropped_share", 0.0)
+                self._runtime_state["reeval_queue"] = reeval_queue
+                self._runtime_state["last_sync"] = time.time()
+                self._runtime_state["current_top"] = current_top
+                self._runtime_state["top_by_family"] = top_by_family
+                self._runtime_state["assigned_tasks"] = data.get("assigned_tasks", [])
+                self._runtime_state["rollout"] = data.get("rollout", {})
+                self._runtime_state["validator_compatibility"] = data.get(
+                    "validator_compatibility", {}
+                )
+                self._runtime_state["leaderboard_version"] = data.get("leaderboard_version", 0)
+                self._runtime_state["benchmark_epoch"] = data.get(
+                    "benchmark_epoch", data.get("current_epoch", 0)
+                )
+                _save_runtime_state(self._runtime_state)
+
+                pending_models = data.get("pending_models", [])
+
+                bt.logging.info(
+                    f"Backend sync successful: leaderboard v{data.get('leaderboard_version', '?')}, "
+                    f"{len(pending_models)} pending model(s)"
+                )
+                benchmark_epoch = data.get("benchmark_epoch", data.get("current_epoch", 0))
+                return {
+                    "current_top": current_top,
+                    "weights": data.get("weights", {}),
+                    "reeval_queue": reeval_queue,
+                    "leaderboard_version": data.get("leaderboard_version", 0),
+                    "pending_models": pending_models,
+                    "assigned_tasks": data.get("assigned_tasks", []),
+                    "rollout": data.get("rollout", {}),
+                    "validator_compatibility": data.get("validator_compatibility", {}),
+                    "benchmark_epoch": benchmark_epoch,
+                    "current_epoch": benchmark_epoch,
+                    "latest_reported_epoch": data.get("latest_reported_epoch"),
+                    "kings": data.get("kings", []),
+                    "kings_by_family": data.get("kings_by_family", {}),
+                    "family_shares": data.get("family_shares", {}),
+                    "burn_extra": data.get("burn_extra", 0.0),
+                    "dropped_share": data.get("dropped_share", 0.0),
+                }
+
+            raise Exception(data.get("error", "Unknown error"))
+
+        except Exception as e:
+            bt.logging.warning(
+                f"Backend API error (sync): {_scrub_url(e)} — fallback active, using cached kings (holds last weights if empty)"
+            )
+
+            return {
+                "current_top": self._runtime_state.get("current_top", {}),
+                "weights": self._runtime_state.get("last_weights", {}),
+                "kings": self._runtime_state.get("last_kings", []),
+                "kings_by_family": self._runtime_state.get("last_kings_by_family", {}),
+                "family_shares": self._runtime_state.get("last_family_shares", {}),
+                "burn_extra": self._runtime_state.get("last_burn_extra", 0.0),
+                "dropped_share": self._runtime_state.get("last_dropped_share", 0.0),
+                "reeval_queue": self._runtime_state.get("reeval_queue", []),
+                "leaderboard_version": 0,
+                "pending_models": [],
+                "assigned_tasks": self._runtime_state.get("assigned_tasks", []),
+                "rollout": self._runtime_state.get("rollout", {}),
+                "validator_compatibility": self._runtime_state.get(
+                    "validator_compatibility", {}
+                ),
+                "benchmark_epoch": self._runtime_state.get("benchmark_epoch", 0),
+                "current_epoch": self._runtime_state.get("benchmark_epoch", 0),
+                "fallback": True,
+                "error": _scrub_url(str(e)),
+            }
+
+    # ──────────────────────────────────────────────────────────────────────
+    # POST /validators/heartbeat
+    # ──────────────────────────────────────────────────────────────────────
+    async def announce_startup(self) -> None:
+        """Report idle before taking any work, so a restart is settled first.
+
+        The backend refuses a new session while the previous one still looks
+        alive. A validator that just restarted is that previous session, so
+        instead of exiting it keeps knocking until the takeover window passes;
+        only a rejection that outlives the window means a real duplicate."""
+        deadline = time.monotonic() + DUPLICATE_SESSION_WAIT_SEC
+        self._announcing = True
+        try:
+            while True:
+                response = await self.post_heartbeat(status="idle", in_flight_seeds=[])
+                if response.get("detail") != "DUPLICATE_VALIDATOR_INSTANCE":
+                    return
+                if time.monotonic() >= deadline:
+                    bt.logging.error(
+                        "Duplicate validator instance detected: another process holds this hotkey; exiting"
+                    )
+                    raise SystemExit(1)
+                bt.logging.info(
+                    "Previous validator session still fresh on the backend; retrying startup heartbeat"
+                )
+                await asyncio.sleep(DUPLICATE_SESSION_RETRY_SEC)
+        finally:
+            self._announcing = False
+
+    async def stand_down(self) -> Dict[str, Any]:
+        """Tell the backend nothing is in the air; it hands every held seed back at once."""
+        self._standing_down = True
+        return await self.post_heartbeat(status="idle", in_flight_seeds=[])
+
+    async def post_heartbeat(
+        self,
+        status: str,
+        current_uid: Optional[int] = None,
+        progress: Optional[int] = None,
+        total_seeds: Optional[int] = None,
+        queue: Optional[list] = None,
+        blocked_queue: Optional[list] = None,
+        active_task: Optional[dict] = None,
+        backend_decision_version: Optional[int] = None,
+        in_flight_seeds: Optional[list] = None,
+    ) -> Dict[str, Any]:
+        if self._standing_down and status != "idle":
+            return {"error": "standing_down"}
+        data: Dict[str, Any] = {"status": status, "session_id": self.session_id}
+        if current_uid is not None:
+            data["current_uid"] = current_uid
+        if progress is not None:
+            data["progress"] = progress
+        if total_seeds is not None:
+            data["total_seeds"] = total_seeds
+        if queue is not None:
+            data["queue"] = queue
+        if blocked_queue is not None:
+            data["blocked_queue"] = blocked_queue
+        if active_task is not None:
+            data["active_task"] = active_task
+        if backend_decision_version is not None:
+            data["backend_decision_version"] = backend_decision_version
+        if in_flight_seeds is not None:
+            data["in_flight_seeds"] = [int(index) for index in in_flight_seeds]
+        name = os.environ.get("VALIDATOR_NAME")
+        if name:
+            data["name"] = name[:32]
+        return await self._post_signed("/validators/heartbeat", data)
+
+    async def post_seed_scores_batch(
+        self,
+        model_uid: int,
+        epoch_number: int,
+        scores: list,
+        task_id: Optional[int] = None,
+        family_id: str = DEFAULT_RUNTIME_FAMILY_ID,
+        provenance: Optional[Dict[str, Any]] = None,
+        retries: int = 3,
+    ) -> Dict[str, Any]:
+        retries = max(retries, 1)
+        last_reason = ""
+        result: Dict[str, Any] = {}
+        payload: Dict[str, Any] = {
+            "model_uid": model_uid,
+            "epoch_number": epoch_number,
+            "family_id": family_id,
+            "scores": [
+                {
+                    **score,
+                    "metric_key": score.get("metric_key") or score.get("map_type"),
+                    "map_type": score.get("map_type") or score.get("metric_key"),
+                }
+                for score in scores
+            ],
+        }
+        if provenance:
+            for key in (
+                "artifact_sha256",
+                "execution_profile_id",
+                "execution_profile_digest",
+                "runner_abi",
+                "runner_image_digest",
+            ):
+                if key in provenance:
+                    payload[key] = provenance[key]
+        if task_id is not None:
+            payload["task_id"] = task_id
+        for attempt in range(retries):
+            result = await self._post_signed("/validators/seed-scores", payload)
+            if result.get("recorded"):
+                return result
+            last_reason = str(
+                result.get("error") or result.get("detail") or "not recorded"
+            )
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+        bt.logging.warning(
+            f"Seed score upload failed for UID {model_uid} "
+            f"after {retries} attempts: {last_reason}"
+        )
+        return result
+
+    # ──────────────────────────────────────────────────────────────────────
+    # POST /validators/epoch/publish
+    # ──────────────────────────────────────────────────────────────────────
+    async def publish_epoch_seeds(
+        self,
+        epoch_number: int,
+        family_id: str,
+        seeds: list[int],
+        started_at: str,
+        ended_at: str,
+        benchmark_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "epoch_number": epoch_number,
+            "family_id": family_id,
+            "seeds": seeds,
+            "started_at": started_at,
+            "ended_at": ended_at,
+        }
+        if benchmark_version is not None:
+            data["benchmark_version"] = benchmark_version
+        return await self._post_signed("/validators/epoch/publish", data)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Task lease and seed upload endpoints
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def claim_seeds(self, task_id: int, count: int = 1) -> Optional[Dict[str, Any]]:
+        """Lease up to ``count`` seeds for the task; None on transport failure."""
+        try:
+            return await self._post_signed(
+                f"/validators/tasks/{int(task_id)}/claim-seeds",
+                {"count": int(count)},
+            )
+        except Exception as exc:
+            bt.logging.warning(f"claim_seeds failed for task {task_id}: {exc}")
+            return None
+
+    async def next_task(self) -> Optional[Dict[str, Any]]:
+        """Long-poll for the next task; None if the window times out."""
+        endpoint = "/validators/next-task"
+        body = b""
+        headers = self._sign_request("GET", endpoint, body)
+        headers["X-Benchmark-Version"] = BENCHMARK_VERSION
+
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}{endpoint}", headers=headers,
+            )
+        except _TRANSPORT_EXCEPTIONS as exc:
+            raise BackendTransportError(
+                f"transport failure on {endpoint}: {_scrub_url(exc)}"
+            ) from exc
+
+        await self._fence_duplicate_instance(resp)
+
+        if resp.status_code in (404, 405):
+            raise BackendProtocolMismatchError(
+                f"Backend does not implement {endpoint}; upgrade the backend "
+                "before running this validator"
+            )
+        if resp.status_code >= 500:
+            raise BackendTransportError(
+                f"backend {resp.status_code} on {endpoint}"
+            )
+        if resp.status_code == 403:
+            if not self._whitelist_warned:
+                bt.logging.warning(
+                    "Not on the trusted validator whitelist — evaluation is "
+                    "disabled. Contact the team to be added. Weights are still "
+                    "mirrored via /sync."
+                )
+                self._whitelist_warned = True
+            return None
+        if resp.status_code == 426:
+            if not self._upgrade_warned:
+                bt.logging.warning(
+                    "Validator version is below the backend's minimum — "
+                    "evaluation is disabled until you upgrade. Update this "
+                    "validator to the required version to resume evaluation."
+                )
+                self._upgrade_warned = True
+            return None
+        if resp.status_code >= 400:
+            bt.logging.warning(f"Backend rejected {endpoint}: {resp.status_code}")
+            return None
+
+        self._whitelist_warned = False
+        self._upgrade_warned = False
+        try:
+            payload = resp.json()
+        except (ValueError, RuntimeError):
+            return None
+        return payload.get("task") if isinstance(payload, dict) else None
+
+    async def fetch_private_artifact(self, model_hash: str, dest: Path) -> bool:
+        """Stream a private model artifact from the operator vault (trusted-only)."""
+        endpoint = f"/validators/models/{model_hash}/private-artifact"
+        headers = self._sign_request("GET", endpoint, b"")
+        try:
+            async with self.client.stream(
+                "GET", f"{self.base_url}{endpoint}", headers=headers,
+            ) as resp:
+                await self._fence_duplicate_instance(resp)
+                if resp.status_code != 200:
+                    bt.logging.warning(
+                        f"private-artifact fetch rejected: {resp.status_code}"
+                    )
+                    return False
+                total = 0
+                over = False
+                fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        if total > MAX_MODEL_BYTES:
+                            over = True
+                            break
+                        handle.write(chunk)
+                if over:
+                    dest.unlink(missing_ok=True)
+                    bt.logging.error(
+                        f"private-artifact exceeds {MAX_MODEL_BYTES}-byte cap; discarded"
+                    )
+                    return False
+            return True
+        except _TRANSPORT_EXCEPTIONS as exc:
+            bt.logging.warning(f"private-artifact transport error: {_scrub_url(exc)}")
+            dest.unlink(missing_ok=True)
+            return False
+
+    async def submit_task_result(
+        self,
+        task_id: int,
+        *,
+        score: float,
+        per_type_scores: Dict[str, float],
+        seeds_evaluated: int,
+        early_failed: bool,
+        epoch_number: int,
+    ) -> Dict[str, Any]:
+        """Submit a task result. Backend recomputes the authoritative score."""
+        endpoint = f"/validators/tasks/{task_id}/result"
+        data: Dict[str, Any] = {
+            "score": score,
+            "metric_breakdown": per_type_scores,
+            "per_type_scores": per_type_scores,
+            "seeds_evaluated": seeds_evaluated,
+            "early_failed": early_failed,
+            "benchmark_version": BENCHMARK_VERSION,
+            "epoch_number": epoch_number,
+        }
+        return await self._post_signed(endpoint, data)
+
+    async def events(
+        self, last_event_id: Optional[int] = None,
+    ) -> "AsyncIterator[Dict[str, Any]]":
+        """Yield SSE frames as dicts. Caller owns reconnect + Last-Event-ID."""
+        endpoint = "/validators/events"
+        body = b""
+        headers = self._sign_request("GET", endpoint, body)
+        headers["X-Benchmark-Version"] = BENCHMARK_VERSION
+        headers["Accept"] = "text/event-stream"
+        if last_event_id is not None:
+            headers["Last-Event-ID"] = str(last_event_id)
+
+        try:
+            async with self.client.stream(
+                "GET", f"{self.base_url}{endpoint}", headers=headers,
+            ) as resp:
+                await self._fence_duplicate_instance(resp)
+                if resp.status_code in (404, 405):
+                    raise BackendProtocolMismatchError(
+                        f"Backend does not implement {endpoint}; upgrade the "
+                        "backend before running this validator"
+                    )
+                if resp.status_code >= 400:
+                    raise BackendTransportError(
+                        f"backend {resp.status_code} on {endpoint}"
+                    )
+
+                buffer: list[str] = []
+                async for line in resp.aiter_lines():
+                    if line == "":
+                        if buffer:
+                            event = _parse_sse_block(buffer)
+                            buffer = []
+                            if event is not None:
+                                yield event
+                    else:
+                        buffer.append(line)
+        except _TRANSPORT_EXCEPTIONS as exc:
+            raise BackendTransportError(
+                f"transport failure on {endpoint}: {_scrub_url(exc)}"
+            ) from exc
+
+
+def _parse_sse_block(lines: list[str]) -> Optional[Dict[str, Any]]:
+    """Parse one SSE frame (lines between blank separators) into a dict."""
+    data_parts: list[str] = []
+    event_id: Optional[int] = None
+    for line in lines:
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            data_parts.append(line[5:].lstrip())
+        elif line.startswith("id:"):
+            raw = line[3:].strip()
+            try:
+                event_id = int(raw) if raw else None
+            except ValueError:
+                event_id = None
+    if not data_parts:
+        return None
+    try:
+        payload = json.loads("\n".join(data_parts))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(payload, dict):
+        if event_id is not None and "event_id" not in payload:
+            payload["event_id"] = event_id
+        return payload
+    return None

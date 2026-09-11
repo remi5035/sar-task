@@ -1,0 +1,12 @@
+.git
+.venv
+venv
+**/__pycache__
+**/*.pyc
+swarm/assets
+swarm/state
+docs
+scripts
+miner
+validator
+Submission

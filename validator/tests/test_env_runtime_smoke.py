@@ -1,0 +1,78 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+from __future__ import annotations
+
+import numpy as np
+
+from swarm.constants import SIM_DT
+from swarm.utils.env_factory import make_env
+from swarm.validator.task_gen import task_for_seed_and_type
+
+
+def test_village_env_builds_for_reported_seed() -> None:
+    task = task_for_seed_and_type(sim_dt=SIM_DT, seed=657398, challenge_type=4)
+    env = make_env(task, gui=False)
+    try:
+        assert env.task.challenge_type == 4
+        assert env.GOAL_POS.shape == (3,)
+        assert float(env.task.start[2]) > 0.0
+        assert float(env.task.goal[2]) >= 0.0
+    finally:
+        env.close()
+
+
+def test_mountain_env_renders_depth_without_er_depth_only() -> None:
+    task = task_for_seed_and_type(sim_dt=SIM_DT, seed=657393, challenge_type=3)
+    env = make_env(task, gui=False)
+    try:
+        obs, info = env.reset(seed=task.map_seed)
+        assert obs["depth"].size > 0
+        assert np.isfinite(obs["depth"]).all()
+
+        obs, reward, terminated, truncated, info = env.step(
+            np.zeros((1, env.action_space.shape[-1]), dtype=np.float32)
+        )
+        assert obs["depth"].size > 0
+        assert np.isfinite(obs["depth"]).all()
+        assert np.isfinite(float(reward))
+        assert isinstance(bool(terminated), bool)
+        assert isinstance(bool(truncated), bool)
+        assert "distance_to_goal" in info
+    finally:
+        env.close()
+
+
+def test_autopilot_env_bootstrap_uses_runtime_profile() -> None:
+    task = task_for_seed_and_type(
+        sim_dt=SIM_DT,
+        seed=657392,
+        challenge_type=1,
+        family_id="cf_autopilot",
+    )
+    env = make_env(task, gui=False)
+    try:
+        assert getattr(env, "sar_mode", None) is False
+        obs, reward, terminated, truncated, info = env.step(
+            np.zeros((1, 5), dtype=np.float32)
+        )
+        assert np.isfinite(obs["depth"]).all()
+        assert np.isfinite(float(reward))
+        assert isinstance(bool(terminated), bool)
+        assert isinstance(bool(truncated), bool)
+    finally:
+        env.close()

@@ -1,0 +1,251 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+"""Single-task worker for the validator.
+
+The ``forward`` loop hands one task at a time to ``run_task``. The
+function downloads the model, runs the requested phase, and submits
+the result. Cancellation flows through ``cancel_flag`` (set by the SSE
+listener); the streaming evaluator checks it at chunk boundaries.
+
+Backend recomputes the authoritative score from ``SeedScore`` rows, so
+the ``score`` we submit is a sanity-check averaged from the seeds the
+validator just ran. Per-type scores are likewise local; backend
+recomputes per-type means by aggregating across the relevant tasks.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any, Dict
+
+import bittensor as bt
+import numpy as np
+
+from swarm.challenge_families import DEFAULT_RUNTIME_FAMILY_ID
+from swarm.core.submission_policy import SUBMISSION_INTERFACE_VERSION
+from swarm.utils.hash import sha256sum
+
+from .evaluation import _run_full_benchmark, _run_screening
+from .model_fetch import _ensure_models_from_backend, _set_private_marker, stored_model_path
+
+
+def _pool_drained(granted: list, pending: int) -> bool:
+    """An empty pool ends the run even while other validators fly trailing seeds."""
+    return not granted and pending == 0
+
+
+async def run_task(
+    self,
+    task: Dict[str, Any],
+    *,
+    cancel_flag: asyncio.Event,
+    wake_flag: asyncio.Event,
+) -> None:
+    uid = int(task.get("uid", -1))
+    phase = str(task.get("phase", ""))
+    task_id = task.get("task_id")
+    family_id = str(task.get("family_id") or DEFAULT_RUNTIME_FAMILY_ID)
+    model_hash = str(task.get("model_hash", ""))
+    github_url = str(task.get("github_url") or "")
+    is_private = bool(task.get("is_private"))
+
+    if uid < 0 or not phase or task_id is None:
+        bt.logging.warning(f"run_task: malformed task payload {task}")
+        return
+
+    # The cleanup covers the fetch too: cancelling mid-download must not leave
+    # private bytes behind, and nothing else sweeps them.
+    model_path = stored_model_path(uid)
+    try:
+        paths = await _ensure_models_from_backend(
+            self,
+            [{
+                "uid": uid, "model_hash": model_hash,
+                "github_url": github_url, "is_private": is_private,
+                "family_id": family_id,
+                "interface_version": str(task.get("interface_version") or SUBMISSION_INTERFACE_VERSION),
+                "artifact_path": str(task.get("artifact_path") or ""),
+            }],
+        )
+        entry = paths.get(uid)
+        if entry is None:
+            bt.logging.warning(f"run_task: failed to fetch model for UID {uid}")
+            return
+        model_path = entry[0]
+        if not model_path.exists() or sha256sum(model_path) != model_hash:
+            bt.logging.warning(f"run_task: model hash mismatch for UID {uid}")
+            return
+        await _run_phase(
+            self, task, uid=uid, phase=phase, task_id=task_id, family_id=family_id,
+            model_path=model_path, cancel_flag=cancel_flag,
+        )
+    finally:
+        if is_private:
+            # Private bytes live on this disk only for the task they were fetched for.
+            model_path.unlink(missing_ok=True)
+            _set_private_marker(model_path, False)
+
+
+async def _run_phase(
+    self,
+    task: Dict[str, Any],
+    *,
+    uid: int,
+    phase: str,
+    task_id: Any,
+    family_id: str,
+    model_path: Path,
+    cancel_flag: asyncio.Event,
+) -> None:
+    seeds_from = int(task.get("seeds_from", 0))
+    seeds_to_raw = task.get("seeds_to")
+    seeds_to = int(seeds_to_raw) if seeds_to_raw is not None else None
+    batch_id = task.get("batch_id")
+    flow = str(task.get("flow") or "")
+    if flow == "seed":
+        # Seed flow has no window: the full seed list is built and the backend feeds indexes.
+        seeds_from = 0
+        seeds_to = None
+    epoch = int(
+        task.get("epoch_number")
+        or self.seed_manager.epoch_number
+        or 0
+    )
+
+    seed_feeder = None
+    if flow == "seed":
+        bt.logging.info(f"[seed-flow] UID {uid}: joined the {phase.lower()} pool")
+
+        async def seed_feeder(free_slots: int):
+            resp = await self.backend_api.claim_seeds(
+                int(task_id), count=max(1, int(free_slots)),
+            )
+            if not resp:
+                return [], False
+            granted = [int(i) for i in resp.get("granted", [])]
+            pending = int(resp.get("pending", 0))
+            others = int(resp.get("leased_other", 0))
+            drained = _pool_drained(granted, pending)
+            if granted:
+                shown = ",".join(map(str, granted[:6])) + ("…" if len(granted) > 6 else "")
+                bt.logging.info(
+                    f"[seed-flow] claimed {len(granted)} seed(s) [{shown}] · pool {pending} open"
+                )
+            elif drained and others:
+                bt.logging.info(
+                    f"[seed-flow] pool drained ({others} seed(s) finishing on other validators) · moving on"
+                )
+            elif drained:
+                bt.logging.info("[seed-flow] pool drained · wrapping up")
+            return granted, drained
+
+    if phase == "SCREENING":
+        result = await _run_screening(
+            self,
+            uid,
+            model_path,
+            reeval=False,
+            task_id=task_id,
+            family_id=family_id,
+            seeds_from=seeds_from,
+            seeds_to=seeds_to,
+            cancel_flag=cancel_flag,
+            batch_id=batch_id,
+            seed_feeder=seed_feeder,
+        )
+        avg, all_scores, per_type_raw, cancel_reason, early_failed = result
+        per_type_avgs = _per_type_means(per_type_raw)
+        seeds_evaluated = seeds_from + len(all_scores)
+        sanity_score = float(avg) if all_scores else 0.0
+    elif phase in ("BENCHMARK", "REEVAL"):
+        result = await _run_full_benchmark(
+            self,
+            uid,
+            model_path,
+            reeval=(phase == "REEVAL"),
+            task_id=task_id,
+            family_id=family_id,
+            cancel_flag=cancel_flag,
+            seeds_from=seeds_from,
+            seeds_to=seeds_to,
+            batch_id=batch_id,
+            seed_feeder=seed_feeder,
+            epoch_number=epoch,
+        )
+        avg, per_type_avgs, all_scores, _per_type_raw, cancel_reason = result
+        seeds_evaluated = seeds_from + len(all_scores)
+        sanity_score = float(avg) if all_scores else 0.0
+        early_failed = False
+    else:
+        bt.logging.warning(f"run_task: unsupported phase {phase}")
+        return
+
+    if flow == "seed" and not all_scores:
+        bt.logging.info(
+            f"run_task: no seeds flown for UID {uid} under seed flow; nothing to submit"
+        )
+        return
+
+    if cancel_reason and "cancel_flag" in cancel_reason:
+        # A finalize broadcast means wrap up and still submit, never abort:
+        # every participating validator must land its ValidatorScore row.
+        listener = getattr(self, "_sse_listener", None)
+        finalize_wrapup = (
+            flow == "seed"
+            and all_scores
+            and listener is not None
+            and getattr(listener, "last_cancel_type", None)
+            in ("benchmark_done", "screening_failed")
+        )
+        if not finalize_wrapup:
+            bt.logging.info(
+                f"run_task: aborted by SSE for UID {uid} ({cancel_reason})"
+            )
+            return
+        bt.logging.info(
+            f"run_task: model finalized elsewhere; submitting wrap-up result for UID {uid}"
+        )
+    if cancel_reason and not early_failed:
+        bt.logging.warning(
+            f"run_task: phase ended with cancel_reason={cancel_reason}; "
+            "letting backend decide via late-submission gate"
+        )
+
+    submission = await self.backend_api.submit_task_result(
+        task_id=int(task_id),
+        score=sanity_score,
+        per_type_scores=per_type_avgs,
+        seeds_evaluated=int(seeds_evaluated),
+        early_failed=bool(early_failed),
+        epoch_number=int(epoch),
+    )
+    reason = submission.get("reason") or ""
+    if reason.startswith("seed_gap_at_index_"):
+        # Backend says we're missing a seed; next /next-task will hand
+        # back a task with the correct seeds_from. Nothing to do here.
+        bt.logging.warning(
+            f"run_task: backend reports seed gap for UID {uid}: {reason}"
+        )
+
+
+def _per_type_means(per_type_raw: Dict[str, list]) -> Dict[str, float]:
+    return {
+        name: float(np.mean(values))
+        for name, values in per_type_raw.items()
+        if values
+    }

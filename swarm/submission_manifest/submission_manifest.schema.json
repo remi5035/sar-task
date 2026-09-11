@@ -1,0 +1,18 @@
+{
+  "manifest_version": "submission_manifest.v1",
+  "manifest_filename": "submission_manifest.json",
+  "repo_layout_rules": {
+    "manifest_path": "submission_manifest.json",
+    "readme_path": "README.md",
+    "artifacts_dir": "artifacts",
+    "artifact_extension": ".zip"
+  },
+  "required_artifact_fields": [
+    "family_id",
+    "interface_version",
+    "artifact_path",
+    "sha256",
+    "size_bytes",
+    "metadata"
+  ]
+}

@@ -1,0 +1,204 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# --------------------------------------------------------------------------- #
+#  Swarm – unified protocol definitions (SDK v2.3, GitHub-hosted models)
+# --------------------------------------------------------------------------- #
+"""
+Handshake (single message):
+
+    Validator            Miner
+    ────────── empty ─────►      (request PolicyRef)
+                   ref   ◄──────  (includes github_url for model download)
+
+Validators download the submission zip directly from the miner's public GitHub
+repository.  No binary streaming over the wire.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Dict, Optional, Tuple
+
+import msgpack
+
+try:
+    import bittensor as bt
+except ImportError:
+    bt = None
+
+
+SCHEMA_VERSION = "5.0.0"
+
+
+class FailureReason(str, Enum):
+    NONE = "NONE"
+    OBSTACLE_COLLISION = "OBSTACLE_COLLISION"
+    NO_TOUCH_SPHERE = "NO_TOUCH_SPHERE"
+    TILT = "TILT"
+    TIMEOUT = "TIMEOUT"
+    SLOW_ACT_STRIKES = "SLOW_ACT_STRIKES"
+    ENV_FAILURE = "ENV_FAILURE"
+    INFEASIBLE = "INFEASIBLE"
+    SPAWN_FAILURE = "SPAWN_FAILURE"
+    EVAL_ERROR = "EVAL_ERROR"
+    INFRA = "INFRA"
+
+
+_SUPPORTED_SCHEMA_VERSIONS: set[str] = {SCHEMA_VERSION}
+
+
+def normalize_version(s) -> str:
+    if not isinstance(s, str):
+        s = str(s) if s is not None else ""
+    if not s:
+        return s
+    return s[1:] if s[0] in ("V", "v") else s
+
+
+def is_supported_schema(version) -> bool:
+    return normalize_version(version) in _SUPPORTED_SCHEMA_VERSIONS
+
+
+# --------------------------------------------------------------------------- #
+# 1.  Core dataclasses                                                        #
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class MapTask:
+    map_seed: int
+    start: Tuple[float, float, float]
+    goal: Tuple[float, float, float]
+    sim_dt: float
+    horizon: float
+    challenge_type: int
+    family_id: str = "cf_autopilot"
+    version: str = SCHEMA_VERSION
+    search_centre: Tuple[float, float] = (0.0, 0.0)
+    search_radius: float = 10.0
+    moving_platform: bool = False
+    num_drones: int = 1
+    starts: Tuple[Tuple[float, float, float], ...] = ()
+    goals: Tuple[Tuple[float, float, float], ...] = ()
+    # Seeded wind, off unless the map opts in: cap on the total wind speed, Dryden
+    # turbulence scale (1 = the standard) and gust bumps per flight.
+    wind_max_mps: float = 0.0
+    wind_turbulence: float = 0.0
+    wind_gusts: int = 0
+
+    def pack(self) -> bytes:
+        return msgpack.packb(asdict(self), use_bin_type=True)
+
+    @staticmethod
+    def unpack(blob: bytes) -> "MapTask":
+        data = msgpack.unpackb(blob, raw=False)
+        if not data.get("family_id"):
+            data["family_id"] = "cf_autopilot"
+        sc = data.get("search_centre")
+        if isinstance(sc, (list, tuple)):
+            data["search_centre"] = tuple(sc)
+        for key in ("starts", "goals"):
+            pads = data.get(key)
+            if isinstance(pads, (list, tuple)):
+                data[key] = tuple(tuple(float(c) for c in pad) for pad in pads)
+        return MapTask(**data)
+
+
+@dataclass(slots=True)
+class ValidationResult:
+    uid: int
+    success: bool
+    time_sec: float
+    score: float
+    failure_reason: str = field(default="NONE", kw_only=True)
+    metrics: Dict[str, Any] = field(default_factory=dict, kw_only=True)
+
+
+# --------------------------------------------------------------------------- #
+# 2.  Model reference                                                         #
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class PolicyRef:
+    sha256: str
+    size_bytes: int
+    github_url: str
+    artifact_path: str
+    family_id: str
+    interface_version: str
+    execution_profile: str
+    profile_digest: str
+    runner_abi: str
+    version: str = "1"
+
+    def as_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------- #
+# 3.  Bidirectional Synapse                                                   #
+# --------------------------------------------------------------------------- #
+Synapse = bt.Synapse if bt is not None else type("Synapse", (), {})  # alias
+
+
+class PolicySynapse(Synapse):
+    """
+    Fields                               Direction
+    ------                               ---------
+    ref          : PolicyRef dict      M → V   model manifest + github_url
+    result       : ValidationResult    V → M   evaluation score
+    """
+    ref: Optional[Dict[str, Any]] = None  # miner → validator
+    result: Optional[Dict[str, Any]] = None  # validator → miner
+
+    version: str = "1"
+    timeout: float = 5.0
+
+    def deserialize(self) -> "PolicySynapse":
+        return self
+
+    # -------- convenience accessors ---------------------------------
+    @property
+    def policy_ref(self) -> Optional[PolicyRef]:
+        return PolicyRef(**self.ref) if self.ref else None  # type: ignore[arg-type]
+
+    @property
+    def validation_result(self) -> Optional[ValidationResult]:
+        return ValidationResult(**self.result) if self.result else None  # type: ignore[arg-type]
+
+    # -------- static builders ---------------------------------------
+    @staticmethod
+    def request_ref() -> "PolicySynapse":
+        """Validator -> Miner: send me your current PolicyRef."""
+        return PolicySynapse()
+
+    @staticmethod
+    def from_ref(ref: PolicyRef) -> "PolicySynapse":
+        return PolicySynapse(ref=ref.as_dict())
+
+    @staticmethod
+    def from_result(res: ValidationResult) -> "PolicySynapse":
+        return PolicySynapse(result=asdict(res))
+
+
+# --------------------------------------------------------------------------- #
+# 4.  Export list                                                             #
+# --------------------------------------------------------------------------- #
+__all__ = [
+    "MapTask",
+    "ValidationResult",
+    "PolicyRef",
+    "PolicySynapse",
+]

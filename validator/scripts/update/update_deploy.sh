@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# ---------------------------------------------------------------
+# update_deploy.sh – Pull latest code, reinstall, restart PM2.
+#
+# Called directly or by auto_update_deploy.sh.
+# If everything is already up‑to‑date it still rebuilds / restarts,
+# so that environment changes (e.g. new requirements) are picked up.
+# ---------------------------------------------------------------
+set -euo pipefail
+IFS=$'\n\t'
+
+###############################################################################
+# 0. Helper – tiny progress banner
+###############################################################################
+STEP=0
+banner() {
+  STEP=$((STEP+1))
+  echo -e "\n[STEP ${STEP}] $*\n"
+}
+
+###############################################################################
+# 1. Configuration (env‑vars → CLI‑args → defaults)
+###############################################################################
+banner "Loading configuration"
+
+# ► Defaults – match the public instructions exactly
+PROCESS_NAME="swarm_validator"          # pm2 process name
+WALLET_NAME=""                          # coldkey  (empty ⇒ prompt if interactive)
+WALLET_HOTKEY=""                        # hotkey   (empty ⇒ prompt if interactive)
+SUBTENSOR_PARAM="--subtensor.network finney"
+
+# ◄ Allow overrides from environment
+PROCESS_NAME="${PROCESS_NAME_OVERRIDE:-$PROCESS_NAME}"
+WALLET_NAME="${WALLET_NAME_OVERRIDE:-$WALLET_NAME}"
+WALLET_HOTKEY="${WALLET_HOTKEY_OVERRIDE:-$WALLET_HOTKEY}"
+SUBTENSOR_PARAM="${SUBTENSOR_PARAM_OVERRIDE:-$SUBTENSOR_PARAM}"
+
+# ◄ Allow overrides from positional CLI args
+[[ $# -ge 1 ]] && PROCESS_NAME="$1"
+[[ $# -ge 2 ]] && WALLET_NAME="$2"
+[[ $# -ge 3 ]] && WALLET_HOTKEY="$3"
+[[ $# -ge 4 ]] && SUBTENSOR_PARAM="$4"
+
+# ◄ Interactive prompts (only if running on TTY and still empty)
+if [[ -t 0 ]]; then
+  [[ -z "$WALLET_NAME"     ]] && read -rp "Coldkey name            : " WALLET_NAME
+  [[ -z "$WALLET_HOTKEY"   ]] && read -rp "Hotkey                  : " WALLET_HOTKEY
+fi
+
+[[ -z "$WALLET_NAME"   || -z "$WALLET_HOTKEY" ]] && {
+  echo "[ERR] WALLET_NAME or WALLET_HOTKEY not set." >&2
+  exit 1
+}
+
+###############################################################################
+# 2. Ensure uv is available
+#
+# Runs before the repo is touched: a machine that predates the uv migration has
+# no uv, and an unattended update that failed after `git reset` would leave the
+# local version matching the remote, so the watcher would never retry.
+###############################################################################
+banner "Checking uv"
+
+UV_VERSION="0.12.8"
+export PATH="$HOME/.local/bin:$PATH"
+
+if ! uv --version >/dev/null 2>&1; then
+  echo "[INFO] uv not found – installing $UV_VERSION"
+  curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" \
+    | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh
+fi
+
+uv --version >/dev/null 2>&1 || {
+  echo "[ERR] uv bootstrap failed – aborting before the repository is modified." >&2
+  exit 1
+}
+
+###############################################################################
+# 3. Locate repo root and virtualenv
+###############################################################################
+banner "Locating repository root & virtualenv"
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+echo "Repository root : $REPO_ROOT"
+
+VENV_DIR="$REPO_ROOT/validator_env"
+PYTHON_BIN="$VENV_DIR/bin/python"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "[INFO] Virtualenv not found – running setup script first."
+  bash "$REPO_ROOT/validator/scripts/main/setup.sh"
+fi
+
+# setup.sh creates the venv relative to its own working directory, so confirm it
+# landed where this script expects rather than failing later at activation.
+[[ -x "$PYTHON_BIN" ]] || {
+  echo "[ERR] Virtualenv still missing at $PYTHON_BIN after setup." >&2
+  exit 1
+}
+
+###############################################################################
+# 4. Update repository
+###############################################################################
+banner "Pulling latest code from origin/main"
+git -C "$REPO_ROOT" fetch --quiet origin main
+git -C "$REPO_ROOT" reset --hard origin/main
+
+###############################################################################
+# 5. Re‑install package inside venv & restart validator
+###############################################################################
+banner "Installing updated Python package"
+source "$VENV_DIR/bin/activate"
+uv pip install --quiet -e "$REPO_ROOT"
+
+banner "Restarting PM2 process: $PROCESS_NAME"
+if ! pm2 restart "$PROCESS_NAME" &>/dev/null; then
+  echo "[WARN] PM2 process not found – starting a fresh one."
+  interp="$(command -v python)"        # fallback if venv not on PATH for pm2
+  pm2 start "$REPO_ROOT/neurons/validator.py" \
+        --name "$PROCESS_NAME" \
+        --interpreter "$interp" \
+        -- \
+          --netuid 124 $SUBTENSOR_PARAM \
+          --wallet.name "$WALLET_NAME" \
+          --wallet.hotkey "$WALLET_HOTKEY"
+fi
+
+banner "Update & redeploy completed – validator running"
+exit 0

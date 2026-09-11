@@ -1,0 +1,183 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+from ._shared import *
+
+
+def ensure_model_dir() -> Path:
+    """Create the model cache, adopting the pre-state-dir folder if this host still has one."""
+    if LEGACY_MODEL_DIR.is_dir() and not any(MODEL_DIR.glob("*")):
+        MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+        if MODEL_DIR.is_dir():
+            MODEL_DIR.rmdir()
+        if LEGACY_MODEL_DIR.is_symlink():
+            MODEL_DIR.symlink_to(LEGACY_MODEL_DIR.resolve())
+            LEGACY_MODEL_DIR.unlink()
+        else:
+            shutil.move(str(LEGACY_MODEL_DIR), str(MODEL_DIR))
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    return MODEL_DIR
+
+
+def stored_model_path(uid: int) -> Path:
+    """Where a UID's fetched archive lives on this validator."""
+    return MODEL_DIR / f"UID_{uid}.zip"
+
+
+def _set_private_marker(model_fp: Path, is_private: bool) -> None:
+    """Mark a stored model as private so the bytes are never kept for forensics
+    and are dropped from disk once their task is done."""
+    marker = model_fp.with_suffix(".private")
+    if is_private:
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def _admitted(path: Path, expected_family: str | None = None) -> bool:
+    if is_model_graph_artifact(path):
+        # a legacy graph artifact declares its family in the graph manifest and
+        # is admitted against the ONNX rules by the runner, inside the sandbox
+        accepted, detail = check_safety(path)
+        declared_family = graph_declared_family
+    else:
+        accepted, detail = validate_submission_zip(path)
+        declared_family = _declared_family
+
+    if not accepted:
+        bt.logging.error(f"Submission rejected: {detail}")
+        return False
+    if expected_family is None:
+        return True
+
+    declared = declared_family(path)
+    if declared is not None and declared != expected_family:
+        bt.logging.error(
+            f"Submission declares family {declared!r}, expected {expected_family!r}"
+        )
+        return False
+    return True
+
+
+def _declared_family(path: Path) -> str | None:
+    """Family named by the packaged policy contract, or None when absent.
+
+    A hand-built zip may omit the contract; only a contract that disagrees with
+    the commitment is a rejection."""
+    try:
+        return str(read_policy_contract_from_zip(path).get("family_id") or "") or None
+    except PolicyInterfaceError:
+        return None
+
+
+async def _download_model_from_github(
+    github_url: str,
+    artifact_path: str,
+    expected_hash: str,
+    expected_family: str,
+    dest: Path,
+    uid: int,
+) -> bool:
+    validated = validate_github_url(github_url, uid=uid)
+    if not validated:
+        return False
+    try:
+        candidates = build_raw_urls(validated, artifact_path)
+    except ValueError:
+        return False
+    downloaded = False
+    for url in candidates:
+        if await download_from_github(url, dest, max_bytes=MAX_MODEL_BYTES):
+            downloaded = True
+            break
+    if not downloaded:
+        dest.unlink(missing_ok=True)
+        return False
+    if sha256sum(dest) != expected_hash or not _admitted(dest, expected_family):
+        dest.unlink(missing_ok=True)
+        return False
+    await verify_new_model_with_docker(dest, expected_hash, f"github-uid-{uid}", uid)
+    return True
+
+
+async def _download_private_model(
+    self, uid: int, model_hash: str, expected_family: str, dest: Path
+) -> bool:
+    ok = await self.backend_api.fetch_private_artifact(model_hash, dest)
+    if not ok or not dest.is_file():
+        dest.unlink(missing_ok=True)
+        return False
+    if sha256sum(dest) != model_hash or not _admitted(dest, expected_family):
+        dest.unlink(missing_ok=True)
+        return False
+    await verify_new_model_with_docker(dest, model_hash, f"private-uid-{uid}", uid)
+    return True
+
+
+async def _ensure_models_from_backend(
+    self, pending_models: list[dict]
+) -> Dict[int, Tuple[Path, str]]:
+    if not pending_models:
+        return {}
+    ensure_model_dir()
+    paths: Dict[int, Tuple[Path, str]] = {}
+    for entry in pending_models:
+        uid = int(entry.get("uid", -1))
+        model_hash = str(entry.get("model_hash", ""))
+        family_id = str(entry.get("family_id", ""))
+        interface_version = str(entry.get("interface_version", ""))
+        github_url = str(entry.get("github_url", "") or "")
+        artifact_path = str(entry.get("artifact_path", "") or "")
+        is_private = bool(entry.get("is_private"))
+        if uid < 0 or not model_hash or not family_id:
+            continue
+        if interface_version not in RUNNABLE_INTERFACE_VERSIONS:
+            continue
+        if model_hash in load_blacklist():
+            bt.logging.warning(
+                f"Skipping blacklisted model {model_hash[:16]}... from UID {uid}"
+            )
+            continue
+        if not is_private and (not github_url or not artifact_path):
+            continue
+        model_fp = stored_model_path(uid)
+        try:
+            if model_fp.is_file() and sha256sum(model_fp) == model_hash and _admitted(model_fp, family_id):
+                _set_private_marker(model_fp, is_private)
+                paths[uid] = (model_fp, github_url)
+                continue
+            model_fp.unlink(missing_ok=True)
+            # The marker goes down before the bytes so a crash mid-fetch never leaves
+            # unmarked private bytes behind.
+            _set_private_marker(model_fp, is_private)
+            if is_private:
+                ok = await _download_private_model(self, uid, model_hash, family_id, model_fp)
+            else:
+                ok = await _download_model_from_github(
+                    github_url, artifact_path, model_hash, family_id, model_fp, uid
+                )
+            if ok and model_fp.is_file():
+                paths[uid] = (model_fp, github_url)
+            else:
+                _set_private_marker(model_fp, False)
+                model_fp.unlink(missing_ok=True)
+        except OSError as exc:
+            bt.logging.warning(f"Model discovery failed for UID {uid}: {exc}")
+            _set_private_marker(model_fp, False)
+            model_fp.unlink(missing_ok=True)
+    bt.logging.info(f"Backend discovery: {len(paths)} admitted submission(s)")
+    return paths

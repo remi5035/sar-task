@@ -1,0 +1,1155 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+"""Process-based parallel seed evaluation for the regular validator path.
+
+This mirrors the benchmark scheduler:
+- one seed per batch
+- configured worker slots with RAM-aware admission
+- parent-side worker stall detection and replacement
+
+The main difference is that validator evaluation degrades failed batches into
+per-seed failures and keeps going, instead of aborting the full run.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import queue as queue_mod
+import re
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional
+
+import bittensor as bt
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
+
+from swarm.benchmark.engine_parts.workers import _unpack_validation_result
+from swarm.constants import N_DOCKER_WORKERS
+from swarm.core.faults import ReasonCode
+from swarm.protocol import FailureReason, ValidationResult
+from swarm.validator.runtime_telemetry import tracker_call
+
+from ._shared import _docker_evaluator_facade, _runtime_profile_from_payload
+
+_MAX_TIMEOUT_RETRIES = 10
+_MAX_RPC_TRANSPORT_RETRIES = 15
+
+# Long-lived host workers accumulate simulator memory across seeds, so idle
+# workers are replaced once they grow past an RSS threshold or a seed budget.
+_WORKER_RECYCLE_RSS_MB = float(os.getenv("SWARM_WORKER_RECYCLE_RSS_MB", "2500"))
+_WORKER_RECYCLE_SEED_BUDGET = int(os.getenv("SWARM_WORKER_RECYCLE_SEEDS", "25"))
+_WORKER_RECYCLE_MIN_SEEDS = 3
+
+
+def _benchmark_engine():
+    import swarm.benchmark.engine as bench_engine
+
+    return bench_engine
+
+
+def _task_seed(task: Any, index: int) -> int:
+    try:
+        return int(getattr(task, "map_seed", index))
+    except Exception:
+        return int(index)
+
+
+def _task_challenge_type(task: Any) -> int:
+    try:
+        return int(getattr(task, "challenge_type", 0))
+    except Exception:
+        return 0
+
+
+def _task_group_name(task: Any, index: int) -> str:
+    bench_engine = _benchmark_engine()
+    seed = _task_seed(task, index)
+    challenge_type = _task_challenge_type(task)
+    group_name = bench_engine._infer_bench_group(challenge_type, seed)
+    if group_name:
+        return str(group_name)
+    return f"type{challenge_type}_unknown"
+
+
+def _emit_seed_complete(
+    on_seed_complete: Optional[Callable[..., None]],
+    seed_meta: Optional[Dict[str, Any]],
+) -> None:
+    if on_seed_complete is None:
+        return
+    try:
+        on_seed_complete(seed_meta)
+    except TypeError:
+        try:
+            on_seed_complete()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _failure_seed_meta(
+    task: Any,
+    *,
+    uid: int,
+    status: str,
+    error: str,
+    elapsed_sec: float = 0.0,
+) -> Dict[str, Any]:
+    return {
+        "uid": int(uid),
+        "map_seed": _task_seed(task, -1),
+        "challenge_type": _task_challenge_type(task),
+        "horizon_sec": float(getattr(task, "horizon", 0.0)),
+        "status": status,
+        "success": False,
+        "sim_time_sec": 0.0,
+        "seed_wall_sec": max(0.0, float(elapsed_sec)),
+        "step_idx": 0,
+        "error": error,
+    }
+
+
+def _seed_status(seed_meta: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(seed_meta, dict):
+        return ""
+    return str(seed_meta.get("status", "")).strip()
+
+
+def _build_result_seed_meta(
+    meta: Optional[dict[str, Any]],
+    *,
+    uid: int,
+    result_obj: ValidationResult,
+    status: str,
+) -> Dict[str, Any]:
+    return {
+        "uid": int(uid),
+        "map_seed": int(meta.get("seed", -1)) if isinstance(meta, dict) else -1,
+        "challenge_type": int(meta.get("challenge_type", -1)) if isinstance(meta, dict) else -1,
+        "horizon_sec": float(meta.get("horizon", 0.0)) if isinstance(meta, dict) else 0.0,
+        "status": status,
+        "success": bool(result_obj.success),
+        "sim_time_sec": float(result_obj.time_sec),
+        "seed_wall_sec": 0.0,
+        "step_idx": 0,
+        "error": "",
+    }
+
+
+def _summary_bucket_for_result(
+    bench_engine: Any,
+    *,
+    status: str,
+    result_obj: Optional[ValidationResult],
+    is_infra_failure: bool = False,
+) -> str:
+    if status == "seed_timeout_strikes":
+        return "slow_act"
+    if status == "seed_env_failure":
+        return "runtime"
+    if bench_engine._is_timeout_retry_status(status):
+        return "timeout"
+    if is_infra_failure or bench_engine._is_infra_failure_status(status):
+        return "runtime"
+    if result_obj is not None and bool(result_obj.success):
+        return "ok"
+    return "failed"
+
+
+def _pop_batch_seed_meta(
+    batch_seed_meta: dict[int, Dict[str, Any]],
+    *,
+    batch_index: int,
+    meta: Optional[dict[str, Any]],
+    uid: int,
+    result_obj: Optional[ValidationResult] = None,
+    fallback_seed_meta: Optional[Dict[str, Any]] = None,
+    prefer_fallback: bool = False,
+) -> Dict[str, Any]:
+    observed = batch_seed_meta.pop(int(batch_index), None)
+    if prefer_fallback and fallback_seed_meta is not None:
+        return fallback_seed_meta
+    if isinstance(observed, dict):
+        return observed
+    if fallback_seed_meta is not None:
+        return fallback_seed_meta
+    if result_obj is None:
+        result_obj = ValidationResult(int(uid), False, 0.0, 0.0)
+    status = "seed_done" if bool(result_obj.success) else "seed_failed"
+    return _build_result_seed_meta(
+        meta,
+        uid=uid,
+        result_obj=result_obj,
+        status=status,
+    )
+
+
+async def _run_process_parallel(
+    *,
+    all_tasks: list,
+    task_meta: list[dict[str, Any]],
+    batch_plan: list[list[int]],
+    uid: int,
+    model_path: Path,
+    effective_workers: int,
+    runtime_tracker: Any = None,
+    on_seed_complete: Optional[Callable[..., None]] = None,
+    on_seed_result: Optional[Callable[[int, Any, str], None]] = None,
+    should_stop: Optional[Callable[[], Optional[str]]] = None,
+    phase_label: str = "eval",
+    prior_seeds_done: int = 0,
+    prior_total_seeds: int = 0,
+    prior_avg: float = 0.0,
+    heartbeat_sec: float = 30.0,
+    runtime_profile: Optional[dict[str, Any]] = None,
+    retry_budget: Optional[dict[str, int]] = None,
+    host_speed_factor: Optional[float] = None,
+    model_image: Optional[str] = None,
+    seed_feeder: Optional[Callable[[int], Any]] = None,
+    initial_pending: Optional[list[int]] = None,
+    on_held_seeds: Optional[Callable[[list[int]], None]] = None,
+) -> list:
+    """Fly every seed through the worker pool, retrying and degrading failures per seed."""
+    bench_engine = _benchmark_engine()
+    ctx = bench_engine._benchmark_mp_context()
+    result_queue = ctx.Queue()
+    progress_queue = ctx.Queue()
+    worker_queues: dict[int, Any] = {}
+    workers: dict[int, Any] = {}
+    worker_active_requests: dict[int, Any] = {}
+    worker_last_heartbeat: dict[int, float] = {}
+    worker_started_at: dict[int, float] = {}
+    worker_seeds_dispatched: dict[int, int] = {}
+    results: list[Optional[ValidationResult]] = [None] * len(all_tasks)
+    scheduler = bench_engine._RamWorkerScheduler(requested_workers=effective_workers)
+    feeder_active = seed_feeder is not None
+    feeder_done = not feeder_active
+    feeder_next_call_at = 0.0
+    if feeder_active:
+        pending_batch_ids = [int(i) for i in (initial_pending or [])]
+    else:
+        pending_batch_ids = list(range(len(batch_plan)))
+    last_held_report: tuple[int, ...] = ()
+    batch_seed_meta: dict[int, Dict[str, Any]] = {}
+    batch_retry_counts: dict[int, int] = {}
+    rpc_transport_retry_counts: dict[int, int] = {}
+    if retry_budget is None:
+        retry_budget = {"timeout": 0, "rpc_transport": 0}
+    stall_timeout_sec = max(
+        bench_engine._PARENT_WORKER_STALL_TIMEOUT_SEC,
+        max(0.0, float(heartbeat_sec)) * 2.0,
+    )
+    resource_poll_interval_sec = max(
+        0.0,
+        float(getattr(bench_engine, "_RESOURCE_POLL_INTERVAL_SEC", 2.0)),
+    )
+    last_resource_poll_at = 0.0
+    stop_reason: Optional[str] = None
+
+    def _emit_seed_result(idx: int, result_obj: Any, status: str) -> None:
+        if on_seed_result is None:
+            return
+        try:
+            on_seed_result(int(idx), result_obj, str(status))
+        except Exception:
+            pass
+    resolved_runtime_profile = _runtime_profile_from_payload(runtime_profile, all_tasks)
+
+    from swarm.constants import (
+        EVAL_SUMMARY_INTERVAL_SEC,
+        GLOBAL_EVAL_BASE_SEC,
+        GLOBAL_EVAL_CAP_SEC,
+        GLOBAL_EVAL_PER_SEED_SEC,
+    )
+
+    max_batch_size = max((len(indices) for indices in batch_plan), default=1)
+    profile_base_sec = (
+        float(resolved_runtime_profile.global_eval_base_sec)
+        if resolved_runtime_profile.global_eval_base_sec is not None
+        else float(GLOBAL_EVAL_BASE_SEC)
+    )
+    profile_per_seed_sec = (
+        float(resolved_runtime_profile.global_eval_per_seed_sec)
+        if resolved_runtime_profile.global_eval_per_seed_sec is not None
+        else float(GLOBAL_EVAL_PER_SEED_SEC)
+    )
+    profile_cap_sec = (
+        float(resolved_runtime_profile.global_eval_cap_sec)
+        if resolved_runtime_profile.global_eval_cap_sec is not None
+        else float(GLOBAL_EVAL_CAP_SEC)
+    )
+    wall_timeout = profile_base_sec + (profile_per_seed_sec * max_batch_size)
+    if profile_cap_sec > 0:
+        wall_timeout = min(wall_timeout, profile_cap_sec)
+    bt.logging.info(
+        f"    {len(all_tasks)} seeds | {effective_workers} workers | "
+        f"timeout={wall_timeout:.0f}s | scheduler={'on' if scheduler.enabled else 'static'} "
+        f"| profile={resolved_runtime_profile.profile_name}"
+    )
+    for line in scheduler.describe_configuration_lines():
+        bt.logging.info(f"    {line}")
+
+    def _spawn_worker(worker_slot: int) -> None:
+        task_queue = ctx.Queue()
+        worker = ctx.Process(
+            target=bench_engine._benchmark_worker_main,
+            args=(worker_slot, task_queue, result_queue, progress_queue),
+            name=f"validator_host_worker_{worker_slot}",
+            daemon=True,
+        )
+        worker.start()
+        worker_queues[worker_slot] = task_queue
+        workers[worker_slot] = worker
+
+    def _close_queue(queue_obj: Any) -> None:
+        try:
+            queue_obj.close()
+        except Exception:
+            pass
+
+    def _restart_worker(worker_slot: int) -> None:
+        worker = workers.get(worker_slot)
+        if worker is not None:
+            try:
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=2.0)
+            except Exception:
+                pass
+        queue_obj = worker_queues.pop(worker_slot, None)
+        if queue_obj is not None:
+            _close_queue(queue_obj)
+        workers.pop(worker_slot, None)
+        worker_last_heartbeat.pop(worker_slot, None)
+        worker_started_at.pop(worker_slot, None)
+        worker_active_requests.pop(worker_slot, None)
+        worker_seeds_dispatched.pop(worker_slot, None)
+        _spawn_worker(worker_slot)
+        tracker_call(runtime_tracker, "mark_docker_worker_restart", worker_slot=int(worker_slot))
+
+    def _worker_rss_mb(worker: Any) -> Optional[float]:
+        if psutil is None:
+            return None
+        try:
+            return float(psutil.Process(worker.pid).memory_info().rss) / (1024.0 * 1024.0)
+        except Exception:
+            return None
+
+    def _worker_recycle_seed_budget(worker_slot: int) -> int:
+        # Stagger budgets across slots so workers do not recycle in lockstep.
+        if effective_workers <= 1:
+            return _WORKER_RECYCLE_SEED_BUDGET
+        spread = 0.9 + 0.2 * (worker_slot / float(effective_workers - 1))
+        return max(_WORKER_RECYCLE_MIN_SEEDS, round(_WORKER_RECYCLE_SEED_BUDGET * spread))
+
+    def _maybe_recycle_idle_workers() -> None:
+        if stop_reason is not None:
+            return
+        for worker_slot in range(effective_workers):
+            if worker_slot in worker_active_requests:
+                continue
+            worker = workers.get(worker_slot)
+            if worker is None or not worker.is_alive():
+                continue
+            served = worker_seeds_dispatched.get(worker_slot, 0)
+            if served < _WORKER_RECYCLE_MIN_SEEDS:
+                continue
+            reason = None
+            if served >= _worker_recycle_seed_budget(worker_slot):
+                reason = f"{served} seeds served"
+            else:
+                rss_mb = _worker_rss_mb(worker)
+                if rss_mb is not None and rss_mb >= _WORKER_RECYCLE_RSS_MB:
+                    reason = f"rss {rss_mb:.0f} MiB after {served} seeds"
+            if reason is None:
+                continue
+            bt.logging.info(f"[Validator eval] recycling idle worker {worker_slot} ({reason})")
+            try:
+                worker_queues[worker_slot].put(None)
+            except Exception:
+                pass
+            try:
+                worker.join(timeout=2.0)
+            except Exception:
+                pass
+            _restart_worker(worker_slot)
+
+    def _maybe_poll_scheduler(*, force: bool = False) -> None:
+        nonlocal last_resource_poll_at
+        now = time.monotonic()
+        if (
+            not force
+            and resource_poll_interval_sec > 0.0
+            and (now - last_resource_poll_at) < resource_poll_interval_sec
+        ):
+            return
+        last_resource_poll_at = now
+        scheduler.refresh_resources()
+
+    def _report_held_seeds() -> None:
+        """Publish the seeds still queued or in the air, so the backend can hand
+        back anything this run stopped working on."""
+        nonlocal last_held_report
+        if on_held_seeds is None:
+            return
+        held: set[int] = set()
+        for batch_index in pending_batch_ids:
+            held.update(int(index) for index in batch_plan[batch_index])
+        for request in worker_active_requests.values():
+            held.update(int(index) for index in request.batch_indices)
+        snapshot = tuple(sorted(held))
+        if snapshot == last_held_report:
+            return
+        last_held_report = snapshot
+        on_held_seeds(list(snapshot))
+
+    def _dispatch_available_batches() -> None:
+        """Hand pending seeds to idle workers while the scheduler admits more."""
+        if stop_reason is not None:
+            return
+        _maybe_recycle_idle_workers()
+        while pending_batch_ids and len(worker_active_requests) < scheduler.active_worker_cap:
+            idle_worker_slots = [
+                slot
+                for slot in range(effective_workers)
+                if slot not in worker_active_requests
+                and slot in workers
+                and workers[slot].is_alive()
+            ]
+            if not idle_worker_slots:
+                return
+            batch_index = bench_engine._select_next_batch_index(
+                pending_batch_ids=pending_batch_ids,
+                batch_plan=batch_plan,
+                task_meta=task_meta,
+                active_batch_ids=[
+                    int(request.batch_index) for request in worker_active_requests.values()
+                ],
+                active_worker_cap=scheduler.active_worker_cap,
+                scheduler=scheduler,
+            )
+            if batch_index is None:
+                return
+            pending_batch_ids.remove(batch_index)
+            batch_indices = list(batch_plan[batch_index])
+            batch_meta = [task_meta[idx] for idx in batch_indices]
+            worker_slot = min(idle_worker_slots)
+            request = bench_engine._ProcessBatchRequest(
+                batch_index=batch_index,
+                batch_indices=batch_indices,
+                tasks=[all_tasks[idx] for idx in batch_indices],
+                uid=uid,
+                model_path=str(model_path),
+                task_total=len(all_tasks),
+                runtime_profile=resolved_runtime_profile.as_dict(),
+                host_speed_factor=host_speed_factor,
+                model_image=model_image,
+                prewarm_next=bool(pending_batch_ids) or (feeder_active and not feeder_done),
+            )
+            worker_active_requests[worker_slot] = request
+            now = time.time()
+            worker_started_at[worker_slot] = now
+            worker_last_heartbeat[worker_slot] = now
+            worker_seeds_dispatched[worker_slot] = (
+                worker_seeds_dispatched.get(worker_slot, 0) + len(batch_indices)
+            )
+            worker_queues[worker_slot].put(request)
+            group_name = str(batch_meta[0]["group"]) if batch_meta else "unknown"
+            tracker_call(
+                runtime_tracker,
+                "mark_docker_dispatch",
+                worker_slot=int(worker_slot),
+                batch_index=int(batch_index),
+                group=str(group_name),
+                seed=int(batch_meta[0].get("index", -1)) if batch_meta else -1,
+                active_worker_cap=int(scheduler.active_worker_cap),
+            )
+
+    def _remember_seed_meta(batch_index: int, seed_meta: Optional[Dict[str, Any]]) -> None:
+        if isinstance(seed_meta, dict):
+            batch_seed_meta[int(batch_index)] = dict(seed_meta)
+
+    def _drain_progress_events() -> None:
+        while True:
+            try:
+                event = progress_queue.get_nowait()
+            except queue_mod.Empty:
+                return
+            if isinstance(event, bench_engine._ProcessWorkerHeartbeat):
+                worker_slot = int(event.worker_id)
+                worker_last_heartbeat[worker_slot] = float(event.ts)
+                if event.event_type == "batch_started":
+                    worker_started_at[worker_slot] = float(event.ts)
+                continue
+            _remember_seed_meta(
+                int(getattr(event, "batch_index", -1)),
+                getattr(event, "seed_meta", None),
+            )
+
+    def _complete_failed_request(
+        worker_slot: int,
+        *,
+        request: Any,
+        status: str,
+        error: str,
+        elapsed_sec: float,
+    ) -> None:
+        bt.logging.warning(
+            f"[Validator eval] worker {worker_slot} failed batch {request.batch_index + 1}/{len(batch_plan)} "
+            f"with status={status}: {error}"
+        )
+        tracker_call(
+            runtime_tracker,
+            "mark_docker_worker_failure",
+            status=str(status),
+            worker_slot=int(worker_slot),
+            error=str(error),
+        )
+        for idx, task in zip(request.batch_indices, request.tasks):
+            if status == "worker_stall_timeout":
+                seed_meta = bench_engine._build_worker_stall_seed_meta(
+                    task,
+                    uid=request.uid,
+                    elapsed_sec=elapsed_sec,
+                    error=error,
+                )
+            else:
+                seed_meta = _failure_seed_meta(
+                    task,
+                    uid=request.uid,
+                    status=status,
+                    error=error,
+                    elapsed_sec=elapsed_sec,
+                )
+            meta = task_meta[int(idx)] if 0 <= int(idx) < len(task_meta) else None
+            _emit_seed_complete(on_seed_complete, seed_meta)
+
+        for idx in request.batch_indices:
+            vr = ValidationResult(
+                int(uid), False, 0.0, 0.0,
+                failure_reason=FailureReason.INFRA.value,
+            )
+            results[idx] = vr
+            meta = task_meta[idx] if idx < len(task_meta) else None
+            _record_seed_result(
+                vr,
+                meta,
+                status=str(status),
+                is_runtime_failure=True,
+            )
+            _emit_seed_result(idx, vr, str(status))
+
+        batch_seed_meta.pop(int(request.batch_index), None)
+
+        worker_active_requests.pop(worker_slot, None)
+        worker_last_heartbeat.pop(worker_slot, None)
+        worker_started_at.pop(worker_slot, None)
+
+    def _check_for_stalled_workers() -> int:
+        completed_now = 0
+        now = time.time()
+        for worker_slot, request in list(worker_active_requests.items()):
+            last_hb = worker_last_heartbeat.get(worker_slot)
+            if last_hb is None or (now - last_hb) < stall_timeout_sec:
+                continue
+            elapsed_sec = max(0.0, now - worker_started_at.get(worker_slot, now))
+            _complete_failed_request(
+                worker_slot,
+                request=request,
+                status="worker_stall_timeout",
+                error=f"worker {worker_slot} heartbeat stalled for {elapsed_sec:.1f}s",
+                elapsed_sec=elapsed_sec,
+            )
+            completed_now += 1
+            _restart_worker(worker_slot)
+            _dispatch_available_batches()
+        return completed_now
+
+    _TYPE_PREFIX = re.compile(r"^type\d+_")
+    seed_stats: dict[str, Any] = {
+        "ok": 0,
+        "failed": 0,
+        "slow_act": 0,
+        "timeout": 0,
+        "runtime": 0,
+        "retried_timeout": 0,
+        "retried_rpc_transport": 0,
+        "scores": [],
+        "per_type": {},
+    }
+    last_summary_chunk_done = 0
+
+    def _type_name(meta: Optional[dict]) -> str:
+        raw = meta.get("group", "unknown") if meta else "unknown"
+        return _TYPE_PREFIX.sub("", raw)
+
+    def _seed_label(meta: Optional[dict]) -> str:
+        seed_index = meta.get("index", "?") if meta else "?"
+        return f"{_type_name(meta)}:#{seed_index}"
+
+    def _record_seed_result(
+        result_obj: Any,
+        meta: Optional[dict],
+        *,
+        status: str,
+        is_runtime_failure: bool = False,
+    ) -> None:
+        if result_obj is None:
+            result_obj = ValidationResult(int(uid), False, 0.0, 0.0)
+        score = float(result_obj.score) if result_obj else 0.0
+        seed_stats["scores"].append(score)
+        tname = _type_name(meta)
+        if tname not in seed_stats["per_type"]:
+            seed_stats["per_type"][tname] = []
+        seed_stats["per_type"][tname].append(score)
+        bucket = _summary_bucket_for_result(
+            bench_engine,
+            status=str(status),
+            result_obj=result_obj,
+            is_infra_failure=is_runtime_failure,
+        )
+        seed_stats[bucket] += 1
+        if bucket == "timeout":
+            seed_stats.setdefault("timeout_seeds", []).append(_seed_label(meta))
+        elif bucket == "runtime":
+            seed_stats.setdefault("runtime_seeds", []).append(_seed_label(meta))
+        elif bucket == "slow_act":
+            seed_stats.setdefault("slow_act_seeds", []).append(_seed_label(meta))
+
+    def _record_timeout_retry(meta: Optional[dict]) -> None:
+        seed_stats["retried_timeout"] += 1
+        seed_stats.setdefault("retried_timeout_seeds", []).append(_seed_label(meta))
+
+    def _record_rpc_transport_retry(meta: Optional[dict]) -> None:
+        seed_stats["retried_rpc_transport"] += 1
+        seed_stats.setdefault("retried_rpc_transport_seeds", []).append(_seed_label(meta))
+
+    def _log_summary() -> None:
+        nonlocal last_summary_chunk_done
+        chunk_done = len(seed_stats["scores"])
+        if chunk_done == 0 or chunk_done == last_summary_chunk_done:
+            return
+        overall_done = prior_seeds_done + chunk_done
+        overall_total = prior_total_seeds if prior_total_seeds > 0 else len(all_tasks)
+        chunk_sum = sum(seed_stats["scores"])
+        prior_sum = prior_avg * prior_seeds_done if prior_seeds_done > 0 else 0.0
+        overall_avg = (prior_sum + chunk_sum) / overall_done if overall_done > 0 else 0.0
+        type_parts = " ".join(
+            f"{t}={sum(s)/len(s):.2f}"
+            for t, s in sorted(seed_stats["per_type"].items()) if s
+        )
+        active = len(worker_active_requests)
+        counts = (
+            f"{seed_stats['ok']} ok, {seed_stats['failed']} failed, "
+            f"{seed_stats['slow_act']} slow_act, "
+            f"{seed_stats['timeout']} timeout, {seed_stats['runtime']} runtime, "
+            f"{seed_stats['retried_timeout']} retried_timeout, "
+            f"{seed_stats['retried_rpc_transport']} retried_rpc_transport"
+        )
+        if feeder_active:
+            # Pool mode: the phase total is not this validator's workload.
+            progress = f"[seed-flow] mine: {overall_done} done, {active} flying · avg={overall_avg:.4f}"
+        else:
+            progress = f"[{phase_label} {overall_done}/{overall_total}] avg={overall_avg:.4f}"
+        line = (
+            f"{progress} | "
+            f"{counts} | {type_parts} | {active}/{effective_workers} workers "
+            f"({scheduler.format_live_status_line()})"
+        )
+        bt.logging.info(line)
+        last_summary_chunk_done = chunk_done
+        if seed_stats.get("retried_timeout_seeds"):
+            bt.logging.info(
+                f"  retried_timeouts: {', '.join(seed_stats['retried_timeout_seeds'])}"
+            )
+        if seed_stats.get("retried_rpc_transport_seeds"):
+            bt.logging.info(
+                f"  retried_rpc_transports: {', '.join(seed_stats['retried_rpc_transport_seeds'])}"
+            )
+        if seed_stats.get("slow_act_seeds"):
+            bt.logging.info(
+                f"  slow_act_failures: {', '.join(seed_stats['slow_act_seeds'])}"
+            )
+        if seed_stats.get("timeout_seeds"):
+            bt.logging.info(f"  timeouts: {', '.join(seed_stats['timeout_seeds'])}")
+        if seed_stats.get("runtime_seeds"):
+            bt.logging.info(
+                f"  runtime_failures: {', '.join(seed_stats['runtime_seeds'])}"
+            )
+
+    last_summary_time = time.time()
+
+    try:
+        for worker_slot in range(effective_workers):
+            _spawn_worker(worker_slot)
+        _maybe_poll_scheduler(force=True)
+        _dispatch_available_batches()
+
+        def _more_work_expected(done_count: int) -> bool:
+            if feeder_active:
+                return bool(
+                    pending_batch_ids or worker_active_requests or not feeder_done
+                )
+            return done_count < len(batch_plan)
+
+        completed_batches = 0
+        while _more_work_expected(completed_batches):
+            if stop_reason is None and should_stop is not None:
+                reason = should_stop()
+                if reason:
+                    stop_reason = str(reason)
+                    dropped = len(pending_batch_ids)
+                    pending_batch_ids.clear()
+                    feeder_done = True
+                    bt.logging.warning(
+                        f"[Validator eval] stop requested for UID {uid} ({stop_reason}); "
+                        f"dropping {dropped} pending seeds, finishing "
+                        f"{len(worker_active_requests)} in-flight"
+                    )
+            if stop_reason is not None and not worker_active_requests:
+                break
+            _drain_progress_events()
+            _maybe_poll_scheduler()
+            if (
+                feeder_active
+                and not feeder_done
+                and stop_reason is None
+                and not pending_batch_ids
+                and len(worker_active_requests) < scheduler.active_worker_cap
+                and time.time() >= feeder_next_call_at
+            ):
+                free_slots = scheduler.active_worker_cap - len(worker_active_requests)
+                granted, drained = await seed_feeder(free_slots)
+                for task_index in granted:
+                    task_index = int(task_index)
+                    if (
+                        0 <= task_index < len(results)
+                        and results[task_index] is None
+                        and task_index not in pending_batch_ids
+                    ):
+                        pending_batch_ids.append(task_index)
+                if drained:
+                    feeder_done = True
+                elif not granted:
+                    feeder_next_call_at = time.time() + 15.0
+            _dispatch_available_batches()
+            _report_held_seeds()
+            completed_batches += _check_for_stalled_workers()
+            if not _more_work_expected(completed_batches):
+                break
+
+            try:
+                payload = result_queue.get(timeout=0.2)
+            except queue_mod.Empty:
+                _maybe_poll_scheduler()
+                _dispatch_available_batches()
+                now = time.time()
+                for worker_slot, worker in list(workers.items()):
+                    if worker.is_alive() or worker.exitcode in (0, None):
+                        continue
+                    request = worker_active_requests.get(worker_slot)
+                    if request is None:
+                        bt.logging.warning(
+                            f"[Validator eval] idle worker {worker_slot} crashed "
+                            f"(exitcode={worker.exitcode}); restarting"
+                        )
+                        _restart_worker(worker_slot)
+                        continue
+                    elapsed_sec = max(0.0, now - worker_started_at.get(worker_slot, now))
+                    _complete_failed_request(
+                        worker_slot,
+                        request=request,
+                        status="batch_exception",
+                        error=f"worker crashed (exitcode={worker.exitcode})",
+                        elapsed_sec=elapsed_sec,
+                    )
+                    completed_batches += 1
+                    _restart_worker(worker_slot)
+                    _dispatch_available_batches()
+                await asyncio.sleep(0)
+                continue
+
+            _drain_progress_events()
+            _maybe_poll_scheduler()
+            _dispatch_available_batches()
+            completed_batches += _check_for_stalled_workers()
+            if completed_batches >= len(batch_plan):
+                break
+
+            worker_slot = int(payload.worker_id)
+            request = worker_active_requests.get(worker_slot)
+            if request is None or int(payload.batch_index) != int(request.batch_index):
+                bt.logging.warning(
+                    f"[Validator eval] ignoring late result from worker {worker_slot} "
+                    f"for batch {int(payload.batch_index) + 1}"
+                )
+                continue
+
+            if payload.error:
+                _complete_failed_request(
+                    worker_slot,
+                    request=request,
+                    status="batch_exception",
+                    error=str(payload.error),
+                    elapsed_sec=float(payload.elapsed_sec),
+                )
+                completed_batches += 1
+                _restart_worker(worker_slot)
+                _dispatch_available_batches()
+                continue
+
+            if len(payload.results) != len(request.batch_indices):
+                _complete_failed_request(
+                    worker_slot,
+                    request=request,
+                    status="batch_exception",
+                    error=(
+                        f"unexpected result count {len(payload.results)} "
+                        f"for batch of {len(request.batch_indices)} seeds"
+                    ),
+                    elapsed_sec=float(payload.elapsed_sec),
+                )
+                completed_batches += 1
+                _restart_worker(worker_slot)
+                _dispatch_available_batches()
+                continue
+
+            prebuilt_seed_meta: dict[int, Dict[str, Any]] = {}
+            if len(request.batch_indices) == 1:
+                idx = int(request.batch_indices[0])
+                vr = _unpack_validation_result(payload.results[0])
+                meta = task_meta[idx] if idx < len(task_meta) else None
+                final_seed_meta = _pop_batch_seed_meta(
+                    batch_seed_meta,
+                    batch_index=int(request.batch_index),
+                    meta=meta,
+                    uid=uid,
+                    result_obj=vr,
+                )
+                final_status = _seed_status(final_seed_meta)
+                prior_retries = int(batch_retry_counts.get(int(request.batch_index), 0))
+                if (
+                    (
+                        bench_engine._is_timeout_retry_status(final_status)
+                        # transient (e.g. host port briefly taken) -> retry, don't score 0
+                        or final_status in ("container_start_failed", "INFRA_DOCKER")
+                    )
+                    and prior_retries < 1
+                    and retry_budget["timeout"] < _MAX_TIMEOUT_RETRIES
+                ):
+                    retry_budget["timeout"] += 1
+                    batch_retry_counts[int(request.batch_index)] = prior_retries + 1
+                    _record_timeout_retry(meta)
+                    bt.logging.warning(
+                        f"[Validator eval] retrying timed-out seed {_seed_label(meta)} "
+                        f"for UID {uid} (retry {prior_retries + 1}/1, "
+                        f"global retries {retry_budget['timeout']}/{_MAX_TIMEOUT_RETRIES}, "
+                        f"status={final_status})"
+                    )
+                    worker_active_requests.pop(worker_slot, None)
+                    worker_last_heartbeat.pop(worker_slot, None)
+                    worker_started_at.pop(worker_slot, None)
+                    pending_batch_ids.append(int(request.batch_index))
+                    _dispatch_available_batches()
+                    continue
+                prior_transport_retries = int(
+                    rpc_transport_retry_counts.get(int(request.batch_index), 0)
+                )
+                if (
+                    bench_engine._is_rpc_transport_status(final_status)
+                    and prior_transport_retries < 1
+                    and retry_budget["rpc_transport"] < _MAX_RPC_TRANSPORT_RETRIES
+                ):
+                    retry_budget["rpc_transport"] += 1
+                    rpc_transport_retry_counts[int(request.batch_index)] = (
+                        prior_transport_retries + 1
+                    )
+                    _record_rpc_transport_retry(meta)
+                    bt.logging.warning(
+                        f"[Validator eval] retrying RPC-transport seed {_seed_label(meta)} "
+                        f"for UID {uid} (retry {prior_transport_retries + 1}/1, "
+                        f"global retries {retry_budget['rpc_transport']}/{_MAX_RPC_TRANSPORT_RETRIES}, "
+                        f"status={final_status})"
+                    )
+                    worker_active_requests.pop(worker_slot, None)
+                    worker_last_heartbeat.pop(worker_slot, None)
+                    worker_started_at.pop(worker_slot, None)
+                    pending_batch_ids.append(int(request.batch_index))
+                    _dispatch_available_batches()
+                    continue
+                prebuilt_seed_meta[idx] = final_seed_meta
+
+            for idx, packed in zip(request.batch_indices, payload.results):
+                vr = _unpack_validation_result(packed)
+                results[idx] = vr
+                meta = task_meta[idx] if idx < len(task_meta) else None
+                final_seed_meta = prebuilt_seed_meta.pop(int(idx), None)
+                if final_seed_meta is None:
+                    final_seed_meta = _pop_batch_seed_meta(
+                        batch_seed_meta,
+                        batch_index=int(request.batch_index),
+                        meta=meta,
+                        uid=uid,
+                        result_obj=vr,
+                    )
+                seed_status = _seed_status(final_seed_meta)
+                if vr is not None and (
+                    bench_engine._is_timeout_retry_status(seed_status)
+                    or bench_engine._is_rpc_transport_status(seed_status)
+                    or bench_engine._is_infra_failure_status(seed_status)
+                    or seed_status in (
+                        "container_start_failed",
+                        "stopped_during_connect",
+                        "stopped_before_seed",
+                    )
+                ):
+                    # Infra failure, not a real 0 — flag it so the upload skips it
+                    # and the seed is re-dispatched on resume instead of scored 0.
+                    vr.failure_reason = FailureReason.INFRA.value
+                _emit_seed_complete(on_seed_complete, final_seed_meta)
+                _record_seed_result(vr, meta, status=seed_status)
+                _emit_seed_result(idx, vr, seed_status)
+
+            worker_active_requests.pop(worker_slot, None)
+            worker_last_heartbeat.pop(worker_slot, None)
+            worker_started_at.pop(worker_slot, None)
+            completed_batches += 1
+            _maybe_poll_scheduler()
+            _dispatch_available_batches()
+
+            now_ts = time.time()
+            if now_ts - last_summary_time >= EVAL_SUMMARY_INTERVAL_SEC:
+                _log_summary()
+                last_summary_time = now_ts
+
+        _drain_progress_events()
+        _log_summary()
+        if stop_reason is not None or feeder_active:
+            # Feeder mode: None entries are seeds this validator never claimed.
+            return results
+        return [
+            result if result is not None else ValidationResult(
+                int(uid), False, 0.0, 0.0, failure_reason=FailureReason.INFRA.value
+            )
+            for result in results
+        ]
+    finally:
+        for worker_slot, queue_obj in list(worker_queues.items()):
+            try:
+                queue_obj.put(None)
+            except Exception:
+                pass
+        for worker in workers.values():
+            try:
+                worker.join(timeout=5.0)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=2.0)
+            except Exception:
+                pass
+        for queue_obj in worker_queues.values():
+            _close_queue(queue_obj)
+        for queue_obj in (result_queue, progress_queue):
+            _close_queue(queue_obj)
+
+
+async def evaluate_seeds_parallel(
+    self,
+    tasks: list,
+    uid: int,
+    model_path: Path,
+    num_workers: int = None,
+    on_seed_complete: Optional[Callable[..., None]] = None,
+    on_seed_result: Optional[Callable[[int, Any, str], None]] = None,
+    should_stop: Optional[Callable[[], Optional[str]]] = None,
+    phase_label: str = "eval",
+    prior_seeds_done: int = 0,
+    prior_total_seeds: int = 0,
+    prior_avg: float = 0.0,
+    retry_budget: Optional[dict[str, int]] = None,
+    seed_feeder: Optional[Callable[[int], Any]] = None,
+    initial_pending: Optional[list[int]] = None,
+    on_held_seeds: Optional[Callable[[list[int]], None]] = None,
+) -> list:
+    """Evaluate validator seeds using the benchmark-grade process scheduler."""
+    if not tasks:
+        return []
+
+    if num_workers is None:
+        num_workers = N_DOCKER_WORKERS
+    runtime_profile = _runtime_profile_from_payload(None, tasks)
+    effective_workers = max(1, min(int(num_workers), len(tasks)))
+    runtime_tracker = getattr(self, "runtime_tracker", None)
+    tracker_call(
+        runtime_tracker,
+        "mark_docker_run_started",
+        requested_workers=int(num_workers),
+        effective_workers=int(effective_workers),
+        total_tasks=int(len(tasks)),
+    )
+
+    from .batch import check_task_versions, prepare_model_image
+
+    if not _docker_evaluator_facade().DockerSecureEvaluator._base_ready:
+        from .batch import _ensure_host_speed_factor
+
+        speed = await _ensure_host_speed_factor(self, 1)
+        if speed is None or not speed.eligible:
+            detail = (
+                "reference calibration is unavailable"
+                if speed is None
+                else f"host speed factor {speed.factor:.2f}x is not eligible to score"
+            )
+            bt.logging.warning(detail)
+            if seed_feeder is not None:
+                # Seed flow: claim nothing and retry later instead of emitting INFRA rows.
+                return [None] * len(tasks)
+            for task in tasks:
+                _emit_seed_complete(
+                    on_seed_complete,
+                    _failure_seed_meta(
+                        task,
+                        uid=uid,
+                        status=ReasonCode.INFRA_CALIBRATION.value,
+                        error=detail,
+                    ),
+                )
+            return [
+                ValidationResult(
+                    uid, False, 0.0, 0.0,
+                    failure_reason=ReasonCode.INFRA_CALIBRATION.value,
+                )
+                for _ in tasks
+            ]
+        if seed_feeder is not None:
+            bt.logging.warning(
+                "Seed-flow eval requires the parallel scheduler; base not ready, retrying later"
+            )
+            return [None] * len(tasks)
+        return await self.evaluate_seeds_batch(
+            tasks,
+            uid,
+            model_path,
+            worker_id=0,
+            on_seed_complete=on_seed_complete,
+            task_offset=0,
+            task_total=len(tasks),
+            runtime_profile_payload=runtime_profile.as_dict(),
+            host_speed_factor=speed.factor,
+            model_image=await asyncio.to_thread(
+                prepare_model_image,
+                self,
+                uid,
+                model_path,
+                runtime_profile_payload=runtime_profile.as_dict(),
+            ),
+        )
+
+    schema_reject = check_task_versions(uid, 0, tasks)
+    if schema_reject is not None:
+        tracker_call(
+            runtime_tracker,
+            "mark_docker_worker_failure",
+            status="unsupported_schema_version",
+            worker_slot=0,
+            error=f"uid {uid} task schema version not supported",
+        )
+        return schema_reject
+
+    model_image = await asyncio.to_thread(
+        prepare_model_image,
+        self,
+        uid,
+        model_path,
+        runtime_profile_payload=runtime_profile.as_dict(),
+    )
+
+    task_meta = [
+        {
+            "group": _task_group_name(task, index),
+            "seed": _task_seed(task, index),
+            "index": index,
+            "challenge_type": _task_challenge_type(task),
+            "horizon": float(getattr(task, "horizon", 0.0)),
+        }
+        for index, task in enumerate(tasks)
+    ]
+    batch_plan = _benchmark_engine()._batch_indices(len(tasks))
+    from .batch import _ensure_host_speed_factor
+
+    speed = await _ensure_host_speed_factor(self, effective_workers)
+    if speed is None or not speed.eligible:
+        detail = (
+            "reference calibration is unavailable"
+            if speed is None
+            else f"host speed factor {speed.factor:.2f}x is not eligible to score"
+        )
+        bt.logging.warning(
+            f"[Validator eval] {detail}; excluding this host from scoring UID {uid}"
+        )
+        for task in tasks:
+            _emit_seed_complete(
+                on_seed_complete,
+                _failure_seed_meta(
+                    task,
+                    uid=uid,
+                    status=ReasonCode.INFRA_CALIBRATION.value,
+                    error=detail,
+                ),
+            )
+        return [
+            ValidationResult(
+                uid, False, 0.0, 0.0,
+                failure_reason=ReasonCode.INFRA_CALIBRATION.value,
+            )
+            for _ in tasks
+        ]
+
+    return await _run_process_parallel(
+        all_tasks=list(tasks),
+        task_meta=task_meta,
+        batch_plan=batch_plan,
+        uid=uid,
+        model_path=model_path,
+        effective_workers=effective_workers,
+        runtime_tracker=runtime_tracker,
+        on_seed_complete=on_seed_complete,
+        on_seed_result=on_seed_result,
+        should_stop=should_stop,
+        heartbeat_sec=30.0,
+        phase_label=phase_label,
+        prior_seeds_done=prior_seeds_done,
+        prior_total_seeds=prior_total_seeds,
+        prior_avg=prior_avg,
+        runtime_profile=runtime_profile.as_dict(),
+        retry_budget=retry_budget,
+        host_speed_factor=speed.factor,
+        model_image=model_image,
+        seed_feeder=seed_feeder,
+        initial_pending=initial_pending,
+        on_held_seeds=on_held_seeds,
+    )
+
+
+__all__ = [name for name in globals() if not name.startswith("__")]
