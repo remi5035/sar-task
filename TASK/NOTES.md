@@ -17,19 +17,34 @@ The requirement is therefore **Linux x86-64, glibc 2.34 or newer, Python 3.10 or
 no macOS, Windows, ARM or Python 3.12 build, and installation fails on any of them with no
 available workaround.
 
+The VPS provided with this task meets these requirements. Its details are in the email.
+
 A GPU is not required at any point.
 
 ## Installation
 
-### PyTorch
-
-The host requirements resolve to the CUDA build of PyTorch, approximately 4 GB of wheels that
-nothing in this task uses. Installing the CPU build first satisfies the dependency:
+The repository ships its own scripts, which handle system packages, Python 3.11, the virtual
+environment and every dependency:
 
 ```bash
+chmod +x miner/src/scripts/install_dependencies.sh miner/src/scripts/setup.sh
+./miner/src/scripts/install_dependencies.sh
+./miner/src/scripts/setup.sh
+source miner_env/bin/activate
+```
+
+Two things those scripts do not cover.
+
+### PyTorch
+
+The requirements resolve to the CUDA build of PyTorch, several gigabytes of wheels that nothing in
+this task uses. To avoid the download, install the CPU build into the virtual environment before
+running `setup.sh`:
+
+```bash
+python3.11 -m venv miner_env && source miner_env/bin/activate
 pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-pip install -e . --no-deps
+./miner/src/scripts/setup.sh
 ```
 
 ### Docker
@@ -77,19 +92,9 @@ It is included because it ships with the upstream repository, not as a recommend
 
 ## Run times
 
-Measured on eight cores, per seed on one worker, for an episode running the full 60-second horizon:
-
-| Environment | CPU time |
-|---|---|
-| city | 19 s |
-| open | 60 s |
-| village | 90 s |
-| mountain | 215 s |
-| forest | 225 s |
-| warehouse | 292 s |
-
-Depth rendering accounts for 45 to 80 percent of each simulation step and runs on CPU. Successful
-episodes terminate early, so observed runs are faster than the table suggests.
+Depth rendering accounts for most of each simulation step and runs on CPU, so evaluation is
+CPU-bound and scales with worker count. Cost per seed varies substantially by environment, and
+successful episodes terminate early rather than running the full 60-second horizon.
 
 A complete 1,100-seed run takes several hours. To iterate against a subset, trim the seed lists,
 keeping all six groups present and non-empty:

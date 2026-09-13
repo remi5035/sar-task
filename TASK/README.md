@@ -3,8 +3,9 @@
 This repository is a copy of the production codebase for Bittensor subnet 124. The simulator, the
 scoring and the 1,100-seed evaluation are the same ones the live network runs.
 
-Read [`NOTES.md`](NOTES.md) before installing. It covers the platform requirements and several
-behaviours of this codebase that are not obvious from the source.
+An Ubuntu VPS is provided for this task, with the details in the accompanying email. Read
+[`NOTES.md`](NOTES.md) before starting: it covers installation, how to run the benchmark, and
+several behaviours of this codebase that are not obvious from the source.
 
 ## The challenge
 
@@ -28,6 +29,9 @@ any outcome short of a confirmed hover = 0.01
 A model's score is the mean across 1,100 procedurally generated seeds spanning six environment
 types. The complete specification is in
 [`docs/families/search_and_rescue.md`](../docs/families/search_and_rescue.md).
+
+[`search_and_rescue.mp4`](search_and_rescue.mp4) shows the mission running across those
+environments: the terrain, the casualties on the ground, and what the drone sees on approach.
 
 ## Starting point
 
