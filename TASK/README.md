@@ -30,8 +30,10 @@ A model's score is the mean across 1,100 procedurally generated seeds spanning s
 types. The complete specification is in
 [`docs/families/search_and_rescue.md`](../docs/families/search_and_rescue.md).
 
-[`search_and_rescue.mp4`](search_and_rescue.mp4) shows the mission running across those
-environments: the terrain, the casualties on the ground, and what the drone sees on approach.
+The mission running across those environments: the terrain, the casualties on the ground, and what
+the drone sees on approach.
+
+https://github.com/user-attachments/assets/ee579a55-5eb2-4f6c-83db-4b1a223b9bb2
 
 ## Starting point
 
