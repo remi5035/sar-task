@@ -1,0 +1,27 @@
+# Liste blanche : seuls les fichiers utiles sont versionnés.
+# Le reste (trajectoires brutes, versions intermédiaires, sondes, vidéos) reste en local, régénérable.
+*
+!*/
+!.gitignore
+!README.md
+!agent_final/*
+!results/*
+!results/figures/*
+!tools/*.py
+!diagnostic/README.md
+!diagnostic/sar_diagnostic.ipynb
+!diagnostic/sar_diag.py
+!diagnostic/make_fake_data.py
+!diagnostic/build_pdf.sh
+!diagnostic/sar_diagnostic_rapport.pdf
+!data/bench/bench_champion_full.json
+!data/bench/bench_v6_full.json
+!data/champion_full/episodes.jsonl
+!data/champion_full/run_config.json
+# tests ciblés lus par le notebook (section 17) + validations larges v5 / v6 / v7
+!data/v1_targeted/episodes.jsonl
+!data/v1_reg_mtn/episodes.jsonl
+!data/v2_rgb/episodes.jsonl
+!data/v5_final/episodes.jsonl
+!data/v6_final/episodes.jsonl
+!data/v7_final/episodes.jsonl

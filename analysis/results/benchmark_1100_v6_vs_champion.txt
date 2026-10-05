@@ -1,0 +1,8 @@
+type1_city       n= 184  A=0.9561  B=0.9520  B-A=-0.0041 IC95=[-0.0221,+0.0119]  succès 177->176 (+1 récup., -2 perdus)
+type2_open       n= 184  A=1.0000  B=1.0000  B-A=+0.0000 IC95=[+0.0000,+0.0000]  succès 184->184 (+0 récup., -0 perdus)
+type3_mountain   n= 184  A=0.7799  B=0.8423  B-A=+0.0624 IC95=[+0.0191,+0.1084]  succès 146->159 (+17 récup., -4 perdus)
+type4_village    n= 190  A=0.8970  B=0.8970  B-A=+0.0000 IC95=[+0.0000,+0.0000]  succès 173->173 (+0 récup., -0 perdus)
+type5_warehouse  n= 182  A=0.8791  B=0.8935  B-A=+0.0144 IC95=[-0.0002,+0.0340]  succès 163->166 (+3 récup., -0 perdus)
+type6_forest     n= 176  A=0.8351  B=0.8351  B-A=+0.0000 IC95=[+0.0000,+0.0000]  succès 150->150 (+0 récup., -0 perdus)
+TOTAL            n=1100  A=0.8917  B=0.9038  B-A=+0.0121 IC95=[+0.0039,+0.0207]  succès 993->1008 (+21 récup., -6 perdus)
+Seeds perdus: [(1000155, 'type3_mountain', 0.992, 0.01), (1000205, 'type3_mountain', 1.0, 0.01), (1000559, 'type3_mountain', 1.0, 0.01), (1000638, 'type1_city', 0.913, 0.01), (1000729, 'type1_city', 0.9, 0.01), (1000759, 'type3_mountain', 1.0, 0.01)]

@@ -1,0 +1,32 @@
+forest    n= 60  champion=0.8429  v6=0.8429  v7=0.8104  v7-v6=-0.0325 IC[-0.0807,+0.0000]  récup=0 perdus=2 petits+=0 petits-=1
+village   n= 60  champion=0.9356  v6=0.9356  v7=0.9179  v7-v6=-0.0177 IC[-0.0495,-0.0009]  récup=0 perdus=1 petits+=0 petits-=4
+warehouse n= 60  champion=0.8877  v6=0.9025  v7=0.8988  v7-v6=-0.0037 IC[-0.0077,-0.0008]  récup=0 perdus=0 petits+=0 petits-=6
+TOUS      n=180  champion=0.8887  v6=0.8937  v7=0.8757  v7-v6=-0.0179 IC[-0.0384,-0.0025]  récup=0 perdus=3 petits+=0 petits-=11
+seeds v7 vs v6 (|écart|>0.01) :
+  1000020 forest    v6=0.975 v7=0.010 NONE -> INFEASIBLE
+  1000060 forest    v6=0.967 v7=0.010 NONE -> INFEASIBLE
+  1000099 village   v6=0.870 v7=0.010 NONE -> INFEASIBLE
+  1000103 forest    v6=0.893 v7=0.868 NONE -> NONE
+  1000131 warehouse v6=0.776 v7=0.759 NONE -> NONE
+  1000148 village   v6=1.000 v7=0.951 NONE -> NONE
+  1000151 warehouse v6=0.975 v7=0.942 NONE -> NONE
+  1000213 village   v6=0.619 v7=0.605 NONE -> NONE
+  1000218 village   v6=0.914 v7=0.818 NONE -> NONE
+  1000227 warehouse v6=0.624 v7=0.596 NONE -> NONE
+  1000231 warehouse v6=0.985 v7=0.950 NONE -> NONE
+  1000302 warehouse v6=0.973 v7=0.951 NONE -> NONE
+  1000315 warehouse v6=0.665 v7=0.574 NONE -> NONE
+  1000341 village   v6=1.000 v7=0.960 NONE -> NONE
+échecs sondés (champion 0.01) :
+  1000009 forest    v7=0.010 INFEASIBLE
+  1000284 forest    v7=0.010 INFEASIBLE
+  1000540 warehouse v7=0.665 NONE
+  1000575 forest    v7=0.010 TILT
+  1000610 village   v7=0.010 INFEASIBLE
+  1000618 forest    v7=0.010 OBSTACLE_COLLISION
+  1000819 forest    v7=0.010 INFEASIBLE
+  1000830 village   v7=0.010 INFEASIBLE
+  1000843 forest    v7=0.010 INFEASIBLE
+  1000863 warehouse v7=0.010 INFEASIBLE
+  1001044 warehouse v7=0.722 NONE
+  1001061 village   v7=0.010 INFEASIBLE
